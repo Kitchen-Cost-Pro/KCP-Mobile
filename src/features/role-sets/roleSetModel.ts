@@ -86,11 +86,12 @@ export function canSeeFinancialImpact(roleSet: RoleSet, amount?: number | null) 
 }
 
 // Operational money on working screens (unit costs, order/GRV totals, wastage and
-// variance values). Owners/managers and operational leads (full / material_only)
-// see it; plain line roles (none) never do. Kept as a plain visibility check so a
-// screen only needs the financialVisibility value, not the whole role set.
+// variance values). Only full financial visibility (owners, area managers and
+// finance) sees it; material_only line roles such as stock controllers and buyers,
+// and none roles, never do. Kept as a plain visibility check so a screen only needs
+// the financialVisibility value, not the whole role set.
 export function canSeeOperationalValues(financialVisibility: FinancialVisibility) {
-  return financialVisibility !== 'none';
+  return financialVisibility === 'full';
 }
 
 function fallbackRoleSetId(role: string) {

@@ -92,10 +92,12 @@ function metricEntries(value: MobileDashboard): Array<{ key: string; metric: Das
     { key: 'activeCountDrafts', metric: value.metrics.activeCountDrafts, icon: ClipboardCheck }
   ];
 }
+// Money/financial metrics (sales, food cost, wastage value) are shown only to full
+// financial visibility. Operational counts (low stock, transfers, count drafts) are
+// always visible, so a stock controller still sees their work without any values.
 function metricVisible(key: string, visibility: FinancialVisibility) {
-  if (visibility === 'full') return true;
-  if (visibility === 'material_only') return !['grossSales', 'netSales', 'theoreticalFoodCost', 'foodCostPercent'].includes(key);
-  return !['grossSales', 'netSales', 'theoreticalFoodCost', 'foodCostPercent', 'wastageValue'].includes(key);
+  const moneyMetrics = ['grossSales', 'netSales', 'theoreticalFoodCost', 'foodCostPercent', 'wastageValue'];
+  return moneyMetrics.includes(key) ? visibility === 'full' : true;
 }
 
 function attentionRoute(item: DashboardAttention, access: AccessSnapshot, flags: MobileFeatureFlags): AppRoute | null {

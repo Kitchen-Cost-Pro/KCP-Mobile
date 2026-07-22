@@ -1376,7 +1376,8 @@ h1, h2, h3, p { margin-top: 0; }
 .brand-mark,.button-primary { border-color: #cbd1d8; background: #cbd1d8; color: #11161c; }
 .button-primary:active { background: #b7c0ca; }
 .brand-lockup strong span,.mini-brand small,.eyebrow,.text-button,.back-button { color: #c3cad3; }
-.action-icon,.workspace-icon,.settings-icon,.dashboard-metrics article > header span,.today-greeting p,.today-section > header > button,.today-action-state,.today-tools button span,.today-completed button { background: #252c35; color: #c6ccd4; }
+.action-icon,.workspace-icon,.settings-icon,.dashboard-metrics article > header span,.today-greeting p,.today-action-state,.today-tools button span,.today-completed button { background: #252c35; color: #c6ccd4; }
+.today-section > header > button { background: transparent; color: #c3cad3; }
 .bottom-nav button.is-active { color: #d2d7dd; }
 .bottom-nav button.is-active::before { background: #c8ced5; }
 .button-quiet,.receiving-principle,.receiving-scan,.manual-barcode button,.receiving-done,.po-recovery { border-color: #46515e; background: #222932; color: #d1d6dc; }
