@@ -1,0 +1,71 @@
+import type { AuthContext, Env } from './types';
+import { error } from './http';
+import { assertLocationAccess, assertWorkspaceAccess, assertWorkspacePermission } from './auth';
+import { guardProtectedOperation } from './approval-engine';
+
+type Row = Record<string, any>;
+function text(value: unknown, fallback = '') { return String(value ?? fallback).trim(); }
+function num(value: unknown, fallback = 0) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback; }
+function object(value: unknown): Row { if (value && typeof value === 'object' && !Array.isArray(value)) return value as Row; try { return JSON.parse(text(value, '{}')); } catch { return {}; } }
+function array(value: unknown): any[] { return Array.isArray(value) ? value : []; }
+function key(value: unknown) { return text(value).toLowerCase().replace(/[\s_-]+/g, ''); }
+function identifier(body: Row, fallback: string) { return text(body.idempotencyKey || body.clientActionId || body.clientRequestId || body.sessionId, fallback); }
+
+async function bodyOf(request: Request) { return object(await request.clone().json().catch(() => ({}))); }
+async function itemValue(env: Env, workspaceId: string, locationId: string, stockItemId: string, quantity: number, uom: string) {
+  const row = await env.DB.prepare(
+    `SELECT si.id,si.name,si.unit,si.unit_cost,si.raw_json,COALESCE(lp.price,si.unit_cost,0) AS effective_cost
+       FROM stock_items si LEFT JOIN stock_item_location_prices lp
+         ON lp.workspace_id=si.workspace_id AND lp.stock_item_id=si.id AND lp.location_id=?3
+      WHERE si.workspace_id=?1 AND si.id=?2 AND si.active=1 LIMIT 1`
+  ).bind(workspaceId, stockItemId, locationId).first<Row>();
+  if (!row) throw new Error('A protected stock item is no longer active.');
+  const raw = object(row.raw_json); const baseUom = text(row.unit, 'ea'); let ratio = 1;
+  if (uom && key(uom) !== 'base' && key(uom) !== key(baseUom)) {
+    const configs = array(raw.uomConfigurations || raw.uomConfig || raw.uomConversions);
+    const match = configs.map(object).find((entry) => key(entry.customUom || entry.name || entry.uom) === key(uom));
+    if (!match || num(match.ratio ?? match.quantityInBase) <= 0) throw new Error('A protected UOM conversion is no longer valid.');
+    ratio = num(match.ratio ?? match.quantityInBase);
+  }
+  const baseQuantity = Math.max(num(quantity), 0) * ratio; const unitCost = Math.max(num(row.effective_cost, num(row.unit_cost)), 0);
+  return { stockItemId: text(row.id), name: text(row.name), baseUom, baseQuantity, unitCost, value: baseQuantity * unitCost };
+}
+
+async function reconcileStockCount(request: Request) {
+  const url = new URL(request.url); url.pathname = url.pathname.replace(/\/commit\/?$/, '/reconcile'); url.search = '';
+  const response = await fetch(new Request(url.toString(), { method: 'POST', headers: { authorization: text(request.headers.get('authorization')), 'content-type': 'application/json' }, body: '{}' }));
+  const data = object(await response.json().catch(() => ({})));
+  if (!response.ok || data.ok === false) throw new Error(text(data.error || data.message, 'The stock take could not be reconciled for approval.'));
+  return data;
+}
+
+/**
+ * Runs before all mutation handlers. It returns a Response only when a protected
+ * transaction is rejected or locked for approval; otherwise the normal handler continues.
+ */
+export async function protectMobileExceptionRoute(request: Request, env: Env, auth: AuthContext, workspaceId: string, resource: string): Promise<Response | null> {
+  if (request.method !== 'POST' && request.method !== 'PATCH' && request.method !== 'PUT') return null;
+  let operationType = ''; let permission = ''; let executionResource = resource; let metricValue = 0; let amount: number | null = null; let title = ''; let summary = ''; let detail: Row = {};
+  const isWastage = resource === 'mobile/wastage'; const isTransfer = resource === 'mobile/transfers'; const countMatch = resource.match(/^mobile\/counts\/([^/]+)\/commit$/);
+  const isManualAdjustment = /^(?:mobile\/)?(?:stock-adjustments|inventory-adjustments|manual-stock-adjustments)(?:\/.*)?$/.test(resource);
+  if (!isWastage && !isTransfer && !countMatch && !isManualAdjustment) return null;
+  await assertWorkspaceAccess(env, auth, workspaceId); const body = await bodyOf(request);
+  try {
+    if (isWastage) {
+      permission = 'nav-adjustments'; operationType = 'high_value_wastage'; const locationId = text(body.locationId); await assertWorkspacePermission(env, auth, workspaceId, permission); await assertLocationAccess(env, auth, workspaceId, locationId, 'approval_wastage');
+      const item = await itemValue(env, workspaceId, locationId, text(body.stockItemId), num(body.quantity), text(body.uom)); amount = metricValue = item.value; title = `Wastage · ${item.name}`; summary = `${item.baseQuantity} ${item.baseUom} at ${locationId}`; detail = { ...item, locationId, wasteReason: text(body.wasteReason), occurredAt: text(body.occurredAt) };
+    } else if (isTransfer) {
+      permission = 'nav-transfers'; operationType = 'large_transfer'; const fromLocationId = text(body.fromLocationId); const toLocationId = text(body.toLocationId); await assertWorkspacePermission(env, auth, workspaceId, permission); await assertLocationAccess(env, auth, workspaceId, fromLocationId, 'approval_transfer_source'); await assertLocationAccess(env, auth, workspaceId, toLocationId, 'approval_transfer_destination');
+      const lines = await Promise.all(array(body.lines).map((line) => { const item = object(line); return itemValue(env, workspaceId, fromLocationId, text(item.stockItemId), num(item.quantity), text(item.uom)); })); amount = metricValue = lines.reduce((total, line) => total + line.value, 0); title = 'Large or unusual transfer'; summary = `${lines.length} item${lines.length === 1 ? '' : 's'} · ${fromLocationId} to ${toLocationId}`; detail = { fromLocationId, toLocationId, lineCount: lines.length, transferValue: amount, lines };
+    } else if (countMatch) {
+      permission = 'nav-stock-count'; operationType = 'stock_take_variance'; await assertWorkspacePermission(env, auth, workspaceId, permission); const reconciliation = await reconcileStockCount(request); const locationId = text(reconciliation.location?.id || reconciliation.locationId); if (locationId) await assertLocationAccess(env, auth, workspaceId, locationId, 'approval_stock_take');
+      amount = metricValue = Math.abs(num(reconciliation.netVarianceValue)); title = `Stock take variance · ${text(reconciliation.location?.name || reconciliation.locationName, 'Location')}`; summary = `${num(reconciliation.countedItemCount)} counted items`; detail = { sessionId: countMatch[1], locationId, countedItemCount: num(reconciliation.countedItemCount), netVarianceValue: num(reconciliation.netVarianceValue), currency: text(reconciliation.currency, 'ZAR') };
+    } else {
+      permission = 'nav-adjustments'; operationType = 'manual_stock_adjustment'; await assertWorkspacePermission(env, auth, workspaceId, permission); const locationId = text(body.locationId); if (locationId) await assertLocationAccess(env, auth, workspaceId, locationId, 'approval_manual_adjustment');
+      const item = body.stockItemId ? await itemValue(env, workspaceId, locationId, text(body.stockItemId), Math.abs(num(body.quantity ?? body.adjustmentQuantity)), text(body.uom)) : null; amount = item?.value ?? null; metricValue = amount ?? Math.abs(num(body.value ?? body.adjustmentValue)); title = 'Manual stock adjustment'; summary = item ? `${item.name} · ${item.baseQuantity} ${item.baseUom}` : text(body.reason, 'Manual inventory exception'); detail = { locationId, reason: text(body.reason), item };
+    }
+    const idempotencyKey = identifier(body, countMatch?.[1] || ''); if (!idempotencyKey) return error(request, env, 400, 'A stable idempotency key is required for protected operations.');
+    const guarded = await guardProtectedOperation(request, env, auth, workspaceId, { operationType, idempotencyKey, title, summary, locationId: text(body.locationId || detail.locationId || body.fromLocationId), amount, currency: text(body.currency || detail.currency, 'ZAR'), metricValue, detail, executionResource, executionMethod: request.method }, body);
+    return guarded.proceed ? null : guarded.response!;
+  } catch (cause) { return error(request, env, 409, cause instanceof Error ? cause.message : 'The protected operation could not be validated.'); }
+}

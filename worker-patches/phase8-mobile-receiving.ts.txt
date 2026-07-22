@@ -1,0 +1,417 @@
+import type { AuthContext, Env } from './types';
+import { json, error, readJson } from './http';
+import {
+  assertWorkspaceAccess,
+  assertWorkspacePermission,
+  assertLocationAccess,
+  getUserAllowedLocationIds
+} from './auth';
+import { resolveLocationDisplayName } from './location-display';
+import { normalizeBarcode, barcodesEqual, splitBarcodeCsv } from './barcode-normalize';
+import { normalizeUomConfigurations, postGoodsReceipt } from './routes';
+
+type Row = Record<string, any>;
+
+function text(value: unknown, fallback = ''): string { return String(value ?? fallback).trim(); }
+function num(value: unknown, fallback = 0): number { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback; }
+function round3(value: number): number { return Math.round((value + Number.EPSILON) * 1000) / 1000; }
+function object(value: unknown): Row {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Row;
+  try { const parsed = JSON.parse(String(value || '{}')); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; }
+  catch { return {}; }
+}
+function array(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
+function cleanDate(value: unknown) {
+  const raw = text(value) || new Date().toISOString();
+  const parsed = new Date(raw.length <= 10 ? `${raw}T00:00:00.000Z` : raw);
+  if (Number.isNaN(parsed.getTime())) throw new Error('Choose a valid received date.');
+  const tomorrow = Date.now() + 86400000;
+  if (parsed.getTime() > tomorrow) throw new Error('Received date cannot be in the future.');
+  return parsed.toISOString();
+}
+async function digest(value: unknown) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(value)));
+  return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+const TERMINAL_ORDER_STATUSES = new Set(['completed', 'complete', 'received', 'closed', 'cancelled', 'canceled', 'deleted', 'archived']);
+function isReceivableStatus(status: unknown) {
+  const normalized = text(status, 'draft').toLowerCase().replace(/[ -]+/g, '_');
+  return normalized !== 'draft' && !TERMINAL_ORDER_STATUSES.has(normalized);
+}
+function lineOutstanding(line: Row) {
+  const ordered = num(line.qty ?? line.quantity ?? line.orderQty ?? line.orderedQty, 0);
+  const received = num(line.receivedQty ?? line.quantityReceived, 0);
+  const explicit = line.remainingQty;
+  const remaining = explicit === undefined || explicit === null || text(explicit) === '' ? ordered - received : num(explicit, ordered - received);
+  return round3(Math.max(remaining, 0));
+}
+function normalizeRequestedEntries(value: unknown) {
+  const entries = array(value).map(object).filter((entry) => num(entry.receivedQuantity ?? entry.receivedQty ?? entry.quantity, 0) > 0).map((entry) => ({
+    lineId: text(entry.lineId || entry.purchaseOrderLineId || entry.id),
+    receivedQuantity: round3(num(entry.receivedQuantity ?? entry.receivedQty ?? entry.quantity, 0)),
+    note: text(entry.note).slice(0, 160)
+  }));
+  if (!entries.length) throw new Error('Enter a received quantity for at least one purchase-order item.');
+  if (entries.length > 200) throw new Error('A mobile receipt supports up to 200 purchase-order lines.');
+  if (entries.some((entry) => !entry.lineId)) throw new Error('Every received quantity must identify its purchase-order line.');
+  if (new Set(entries.map((entry) => entry.lineId)).size !== entries.length) throw new Error('Each purchase-order line may be received only once per receipt.');
+  if (entries.some((entry) => !(entry.receivedQuantity > 0) || entry.receivedQuantity > 1000000000)) throw new Error('A received quantity is outside the supported mobile range.');
+  return entries;
+}
+
+async function loadOrderRow(env: Env, workspaceId: string, orderId: string) {
+  return env.DB.prepare(
+    `SELECT po.id, po.supplier_id, po.status, po.po_number, po.target_location_id, po.ordered_at, po.expected_at,
+            po.total_ex, po.total_vat, po.total_inc, po.raw_json, po.created_at, po.updated_at,
+            s.name AS supplier_name, l.name AS location_name, l.display_name AS location_display_name,
+            l.external_name AS location_external_name, l.kind AS location_kind, l.active AS location_active, l.raw_json AS location_raw_json
+       FROM purchase_orders po
+       LEFT JOIN suppliers s ON s.id = po.supplier_id AND s.workspace_id = po.workspace_id
+       LEFT JOIN locations l ON l.id = po.target_location_id AND l.workspace_id = po.workspace_id
+      WHERE po.workspace_id = ?1 AND po.id = ?2 LIMIT 1`
+  ).bind(workspaceId, orderId).first<Row>();
+}
+
+function orderHeader(row: Row) {
+  const raw = object(row.raw_json);
+  const rawLines = array(raw.items).map(object);
+  const locationId = text(raw.locationId || raw.targetLocation || row.target_location_id);
+  const location = {
+    id: locationId,
+    name: resolveLocationDisplayName({
+      id: locationId,
+      name: row.location_name,
+      display_name: row.location_display_name,
+      external_name: row.location_external_name,
+      kind: row.location_kind,
+      active: row.location_active,
+      raw_json: row.location_raw_json
+    }),
+    kind: text(row.location_kind, 'selling') || 'selling'
+  };
+  const lineCount = rawLines.length;
+  const outstandingLineCount = rawLines.filter((line) => lineOutstanding(line) > 0).length;
+  const receivedLineCount = rawLines.filter((line) => num(line.receivedQty ?? line.quantityReceived, 0) > 0).length;
+  const status = text(row.status || raw.status, 'draft').toLowerCase();
+  return {
+    id: text(row.id),
+    poNumber: text(raw.poNumber || raw.reference || row.po_number || row.id),
+    supplierId: text(raw.supplierId || row.supplier_id),
+    supplierName: text(raw.supplierName || row.supplier_name, 'Supplier unavailable'),
+    location,
+    status,
+    statusBucket: status === 'partially_received' || receivedLineCount > 0 ? 'partial' : 'awaiting',
+    orderedAt: text(raw.date || row.ordered_at),
+    expectedAt: text(raw.expectedAt || row.expected_at),
+    totalEx: num(row.total_ex, num(raw.totalEx, 0)),
+    totalInc: num(row.total_inc, num(raw.totalInc, 0)),
+    lineCount,
+    outstandingLineCount,
+    receivedLineCount,
+    updatedAt: text(row.updated_at || raw.updatedAt || row.created_at)
+  };
+}
+
+async function loadOrder(env: Env, auth: AuthContext, workspaceId: string, orderId: string) {
+  const row = await loadOrderRow(env, workspaceId, orderId);
+  if (!row) throw new Error('Purchase order could not be found.');
+  const header = orderHeader(row);
+  if (!isReceivableStatus(header.status) || !header.outstandingLineCount) throw new Error('This purchase order no longer has items available to receive.');
+  if (!header.location.id) throw new Error('This purchase order needs a receiving location in KCP.');
+  await assertLocationAccess(env, auth, workspaceId, header.location.id, 'mobile_receiving');
+  const rawLines = array(object(row.raw_json).items).map(object);
+  const lines = [];
+  for (let index = 0; index < rawLines.length; index += 1) {
+    const line = rawLines[index];
+    const stockItemId = text(line.stockItemId || line.ingredientId || line.ingId || line.id);
+    const stock = stockItemId ? await env.DB.prepare(
+      `SELECT id, name, unit, barcode_csv, raw_json FROM stock_items
+        WHERE workspace_id = ?1 AND id = ?2 AND active = 1 LIMIT 1`
+    ).bind(workspaceId, stockItemId).first<Row>() : null;
+    if (!stock) continue;
+    const stockRaw = object(stock.raw_json);
+    const orderedQuantity = round3(num(line.qty ?? line.quantity ?? line.orderQty ?? line.orderedQty, 0));
+    const previouslyReceivedQuantity = round3(num(line.receivedQty ?? line.quantityReceived, 0));
+    const outstandingQuantity = lineOutstanding(line);
+    if (!(outstandingQuantity > 0)) continue;
+    const packSize = Math.max(num(line.packSize ?? line.pack_size, 1), 1);
+    const baseUom = text(stock.unit || line.baseUom || line.unit, 'ea') || 'ea';
+    const receivingUom = text(line.selectedUom || line.purchaseUom || line.receivingUom || line.unit, baseUom) || baseUom;
+    const barcodeSet = new Set(splitBarcodeCsv(stock.barcode_csv).map((entry) => entry.raw).filter(Boolean));
+    for (const barcode of array(stockRaw.barcodes)) if (normalizeBarcode(barcode).raw) barcodeSet.add(normalizeBarcode(barcode).raw);
+    const uoms = normalizeUomConfigurations(stockRaw.uomConfigurations).map((config) => ({
+      name: text(config.customUom), quantityInBase: num(config.ratio, 0), barcode: text(config.barcode) || null
+    })).filter((config) => config.name && config.quantityInBase > 0);
+    for (const config of uoms) if (config.barcode) barcodeSet.add(config.barcode);
+    const lineLocationId = text(line.locationId || line.targetLocation || header.location.id);
+    await assertLocationAccess(env, auth, workspaceId, lineLocationId, 'mobile_receiving_line');
+    lines.push({
+      id: text(line.id || line.purchaseOrderLineId || line.poLineId || `${header.id}:line:${index}:${stockItemId}`),
+      stockItemId,
+      name: text(line.stockItemName || line.ingredientName || stock.name),
+      sku: text(line.sku || stockRaw.sku || stockRaw.customSku || stockRaw.stockCode) || null,
+      category: text(stockRaw.category || line.category),
+      baseUom,
+      receivingUom,
+      packSize,
+      unitCost: Math.max(num(line.unitCost ?? line.cost ?? line.price, 0), 0),
+      orderedQuantity,
+      previouslyReceivedQuantity,
+      outstandingQuantity,
+      locationId: lineLocationId,
+      locationName: lineLocationId === header.location.id ? header.location.name : text(line.locationName || line.targetLocationName),
+      barcodes: [...barcodeSet],
+      uoms
+    });
+  }
+  if (!lines.length) throw new Error('This purchase order no longer has active stock items available to receive.');
+  return { ...header, lines };
+}
+
+async function duplicateInvoice(env: Env, workspaceId: string, supplierId: string, invoiceNumber: string) {
+  if (!supplierId || !invoiceNumber) return null;
+  return env.DB.prepare(
+    `SELECT id, invoice_number FROM grvs
+      WHERE workspace_id = ?1 AND supplier_id = ?2 AND lower(trim(invoice_number)) = lower(trim(?3))
+      ORDER BY created_at DESC LIMIT 1`
+  ).bind(workspaceId, supplierId, invoiceNumber).first<Row>();
+}
+
+async function buildPreview(env: Env, auth: AuthContext, workspaceId: string, input: Row) {
+  const purchaseOrderId = text(input.purchaseOrderId || input.orderId);
+  const invoiceNumber = text(input.invoiceNumber || input.invoice).slice(0, 120);
+  const deliveryNote = text(input.deliveryNote || input.deliveryNoteReference).slice(0, 120);
+  const note = text(input.note || input.notes).slice(0, 500);
+  if (!purchaseOrderId) throw new Error('Choose a purchase order to receive.');
+  if (!invoiceNumber) throw new Error('Enter the supplier invoice number.');
+  const receivedAt = cleanDate(input.receivedAt || input.date);
+  const entries = normalizeRequestedEntries(input.entries);
+  const order = await loadOrder(env, auth, workspaceId, purchaseOrderId);
+  const byId = new Map<string, Row>(order.lines.map((line: Row) => [text(line.id), line]));
+  const selected: Row[] = entries.map((entry): Row => {
+    const line = byId.get(entry.lineId);
+    if (!line) throw new Error('A purchase-order line changed or is no longer available. Refresh the order.');
+    if (entry.receivedQuantity > num(line.outstandingQuantity) + 0.0005) throw new Error(`${text(line.name)} exceeds the outstanding quantity of ${num(line.outstandingQuantity)} ${text(line.receivingUom)}.`);
+    const remainingAfter = round3(num(line.outstandingQuantity) - entry.receivedQuantity);
+    const lineTotalEx = round3(entry.receivedQuantity * num(line.packSize, 1) * num(line.unitCost, 0));
+    return { ...line, receivedQuantity: entry.receivedQuantity, remainingAfter, note: entry.note, lineTotalEx };
+  });
+  const duplicate = await duplicateInvoice(env, workspaceId, order.supplierId, invoiceNumber);
+  const blockingErrors = duplicate ? [`Invoice ${invoiceNumber} has already been used on GRV ${text(duplicate.id)} for this supplier.`] : [];
+  const warnings = selected.filter((line) => !(num(line.unitCost) > 0)).map((line) => `${text(line.name)} has a zero purchase-order cost. Mobile receiving will not change its cost.`);
+  const totalEx = round3(selected.reduce((sum, line) => sum + num(line.lineTotalEx), 0));
+  const totalVat = round3(totalEx * 0.15);
+  const stateData = {
+    purchaseOrderId: order.id,
+    status: order.status,
+    updatedAt: order.updatedAt,
+    locationId: order.location.id,
+    lines: order.lines.map((line: Row) => [line.id, line.stockItemId, line.orderedQuantity, line.previouslyReceivedQuantity, line.outstandingQuantity])
+  };
+  const orderStateToken = await digest(stateData);
+  const previewData = {
+    orderStateToken, invoiceNumber, deliveryNote, receivedAt: receivedAt.slice(0, 10),
+    entries: selected.map((line) => [line.id, line.receivedQuantity, line.remainingAfter])
+  };
+  const remainingLineCount = order.lines.filter((line: Row) => {
+    const received = selected.find((entry) => entry.id === line.id);
+    return received ? num(received.remainingAfter) > 0 : num(line.outstandingQuantity) > 0;
+  }).length;
+  return {
+    order: { id: order.id, poNumber: order.poNumber, supplierId: order.supplierId, supplierName: order.supplierName, location: order.location, status: order.status },
+    entries: selected,
+    invoiceNumber,
+    deliveryNote,
+    note,
+    receivedAt,
+    totalEx,
+    totalVat,
+    totalInc: round3(totalEx + totalVat),
+    remainingLineCount,
+    completionStatus: remainingLineCount ? 'partially_received' : 'completed',
+    blockingErrors,
+    warnings,
+    orderStateToken,
+    previewToken: await digest(previewData),
+    previewedAt: new Date().toISOString()
+  };
+}
+
+function receiptResult(row: Row, duplicate: boolean, orderStatus = '') {
+  const raw = object(row.raw_json || row.raw);
+  return {
+    ok: true,
+    duplicate,
+    receiptId: text(row.id || raw.id),
+    transactionReference: text(raw.transactionReference || row.transactionReference),
+    purchaseOrderId: text(raw.sourcePoId),
+    poNumber: text(raw.poNumber),
+    supplierName: text(raw.supplierName || raw.supplier),
+    locationName: text(raw.locationName || raw.targetLocationName),
+    invoiceNumber: text(raw.invoice),
+    deliveryNote: text(raw.deliveryNote),
+    receivedAt: text(raw.timestamp || raw.date),
+    lineCount: array(raw.items).length,
+    totalEx: num(raw.totalEx),
+    totalVat: num(raw.totalVat),
+    totalInc: num(raw.totalInc),
+    status: text(orderStatus, 'partially_received'),
+    items: array(raw.items).map(object).map((line) => ({
+      stockItemId: text(line.stockItemId), name: text(line.stockItemName),
+      receivedQuantity: num(line.receivedQty), unit: text(line.receivingUom || line.selectedUom || line.unit),
+      baseQuantity: num(line.baseQuantity), lineTotalEx: num(line.lineTotalEx)
+    }))
+  };
+}
+
+export async function getMobileReceivingBootstrap(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-grv');
+  const allowed = await getUserAllowedLocationIds(env, auth, workspaceId);
+  const rows = await env.DB.prepare(
+    `SELECT po.id, po.supplier_id, po.status, po.po_number, po.target_location_id, po.ordered_at, po.expected_at,
+            po.total_ex, po.total_vat, po.total_inc, po.raw_json, po.created_at, po.updated_at,
+            s.name AS supplier_name, l.name AS location_name, l.display_name AS location_display_name,
+            l.external_name AS location_external_name, l.kind AS location_kind, l.active AS location_active, l.raw_json AS location_raw_json
+       FROM purchase_orders po
+       LEFT JOIN suppliers s ON s.id = po.supplier_id AND s.workspace_id = po.workspace_id
+       LEFT JOIN locations l ON l.id = po.target_location_id AND l.workspace_id = po.workspace_id
+      WHERE po.workspace_id = ?1 ORDER BY po.updated_at DESC LIMIT 500`
+  ).bind(workspaceId).all<Row>();
+  const orders = (rows.results || []).map(orderHeader).filter((order) => isReceivableStatus(order.status) && order.outstandingLineCount > 0 && order.location.id && (allowed === null || allowed.includes(order.location.id)));
+  const recentRows = await env.DB.prepare(
+    `SELECT g.id, g.raw_json, g.received_at, g.invoice_number, g.total_ex, g.total_vat, g.total_inc, s.name AS supplier_name
+       FROM grvs g LEFT JOIN suppliers s ON s.id = g.supplier_id AND s.workspace_id = g.workspace_id
+      WHERE g.workspace_id = ?1 AND g.purchase_order_id IS NOT NULL ORDER BY g.received_at DESC LIMIT 25`
+  ).bind(workspaceId).all<Row>();
+  const recentReceipts = (recentRows.results || []).map((row) => {
+    const raw = object(row.raw_json);
+    return {
+      id: text(row.id), transactionReference: text(raw.transactionReference), purchaseOrderId: text(raw.sourcePoId),
+      poNumber: text(raw.poNumber), supplierName: text(raw.supplierName || row.supplier_name), locationId: text(raw.locationId),
+      locationName: text(raw.locationName), invoiceNumber: text(raw.invoice || row.invoice_number), receivedAt: text(raw.timestamp || row.received_at),
+      lineCount: array(raw.items).length, totalEx: num(row.total_ex, num(raw.totalEx))
+    };
+  }).filter((receipt) => allowed === null || allowed.includes(receipt.locationId));
+  return json(request, env, { ok: true, workspaceId, canReceive: orders.length > 0, orders, recentReceipts });
+}
+
+export async function getMobileReceivingOrder(request: Request, env: Env, auth: AuthContext, workspaceId: string, orderId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-grv');
+  try { return json(request, env, { ok: true, order: await loadOrder(env, auth, workspaceId, orderId) }); }
+  catch (cause) { return error(request, env, 400, cause instanceof Error ? cause.message : 'Purchase order could not be loaded.'); }
+}
+
+export async function getMobileReceivingBarcode(request: Request, env: Env, auth: AuthContext, workspaceId: string, orderId: string, barcodeParam: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-grv');
+  try {
+    const order = await loadOrder(env, auth, workspaceId, orderId);
+    const scanned = normalizeBarcode(decodeURIComponent(barcodeParam || ''));
+    if (!scanned.raw) return error(request, env, 400, 'A barcode is required.');
+    const matches = order.lines.filter((line: Row) => array(line.barcodes).some((barcode) => barcodesEqual(barcode, scanned.raw)));
+    if (!matches.length) return json(request, env, { ok: true, matched: false, reason: 'not_on_order', barcode: scanned.raw });
+    if (matches.length > 1) return json(request, env, { ok: true, matched: false, reason: 'ambiguous', barcode: scanned.raw, candidates: matches.map((line: Row) => ({ id: line.id, name: line.name })) });
+    return json(request, env, { ok: true, matched: true, barcode: scanned.raw, line: matches[0] });
+  } catch (cause) { return error(request, env, 400, cause instanceof Error ? cause.message : 'Barcode could not be checked against this order.'); }
+}
+
+export async function postMobileReceivingPreview(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-grv');
+  try { return json(request, env, { ok: true, ...(await buildPreview(env, auth, workspaceId, await readJson<Row>(request))) }); }
+  catch (cause) { return error(request, env, 400, cause instanceof Error ? cause.message : 'Delivery preview failed.'); }
+}
+
+export async function postMobileReceivingCommit(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-grv');
+  const body = await readJson<Row>(request);
+  if (body.confirm !== true) return error(request, env, 400, 'Explicit confirmation is required.');
+  const clientReceiptId = text(body.idempotencyKey || body.clientReceiptId);
+  if (!clientReceiptId) return error(request, env, 400, 'A stable mobile receipt ID is required.');
+  let entries;
+  try { entries = normalizeRequestedEntries(body.entries); }
+  catch (cause) { return error(request, env, 400, cause instanceof Error ? cause.message : 'Received quantities are invalid.'); }
+  const payloadFingerprint = await digest({
+    purchaseOrderId: text(body.purchaseOrderId || body.orderId), invoiceNumber: text(body.invoiceNumber || body.invoice),
+    deliveryNote: text(body.deliveryNote), receivedAt: text(body.receivedAt || body.date).slice(0, 10), note: text(body.note),
+    entries: entries.map((entry) => [entry.lineId, entry.receivedQuantity, entry.note])
+  });
+  const existingClientReceipt = await env.DB.prepare(
+    `SELECT g.id, g.raw_json, po.status AS order_status FROM grvs g
+       LEFT JOIN purchase_orders po ON po.workspace_id = g.workspace_id AND po.id = g.purchase_order_id
+      WHERE g.workspace_id = ?1 AND json_extract(g.raw_json, '$.mobileClientReceiptId') = ?2 LIMIT 1`
+  ).bind(workspaceId, clientReceiptId).first<Row>();
+  if (existingClientReceipt) {
+    const raw = object(existingClientReceipt.raw_json);
+    if (text(raw.mobilePayloadFingerprint) !== payloadFingerprint) return error(request, env, 409, 'This mobile receipt ID is already attached to different values. Start a new receipt.');
+    return json(request, env, receiptResult(existingClientReceipt, true, text(existingClientReceipt.order_status)));
+  }
+
+  let preview;
+  try { preview = await buildPreview(env, auth, workspaceId, body); }
+  catch (cause) { return error(request, env, 400, cause instanceof Error ? cause.message : 'Delivery validation failed.'); }
+  if (preview.blockingErrors.length) return json(request, env, { ok: false, error: 'This delivery cannot be posted.', code: 'receiving_blocked', blockingErrors: preview.blockingErrors }, { status: 409 });
+  if (!text(body.previewToken) || text(body.previewToken) !== preview.previewToken) return error(request, env, 409, 'The purchase order or received values changed. Refresh the delivery preview before posting.');
+
+  const receiptId = `mobile-grv-${(await digest({ workspaceId, purchaseOrderId: preview.order.id, orderStateToken: preview.orderStateToken })).slice(0, 40)}`;
+  const receipt = {
+    id: receiptId,
+    mobileClientReceiptId: clientReceiptId,
+    mobilePayloadFingerprint: payloadFingerprint,
+    mobilePreviewToken: preview.previewToken,
+    sourcePoId: preview.order.id,
+    poNumber: preview.order.poNumber,
+    supplierId: preview.order.supplierId,
+    supplierName: preview.order.supplierName,
+    invoice: preview.invoiceNumber,
+    deliveryNote: preview.deliveryNote,
+    date: preview.receivedAt.slice(0, 10),
+    locationId: preview.order.location.id,
+    locationName: preview.order.location.name,
+    notes: preview.note,
+    overrideCostPrice: false,
+    pricesIncludeVat: false,
+    items: preview.entries.map((line: Row) => ({
+      id: line.id,
+      purchaseOrderLineId: line.id,
+      stockItemId: line.stockItemId,
+      stockItemName: line.name,
+      orderedQty: line.orderedQuantity,
+      receivedQty: line.receivedQuantity,
+      packSize: line.packSize,
+      unit: line.baseUom,
+      selectedUom: line.receivingUom,
+      unitCost: line.unitCost,
+      locationId: line.locationId,
+      locationName: line.locationName,
+      note: line.note
+    }))
+  };
+  const inner = new Request(`https://do/api/workspaces/${encodeURIComponent(workspaceId)}/grvs`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ receipt })
+  });
+  let response: Response;
+  try { response = await postGoodsReceipt(inner, env, auth, workspaceId); }
+  catch (cause) {
+    const raced = await env.DB.prepare(`SELECT id, raw_json FROM grvs WHERE workspace_id = ?1 AND id = ?2 LIMIT 1`).bind(workspaceId, receiptId).first<Row>();
+    if (!raced) throw cause;
+    response = new Response(JSON.stringify({ ok: true, id: receiptId, duplicate: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  const data = await response.json().catch(() => ({})) as Row;
+  if (!response.ok || data.ok === false) return json(request, env, { ok: false, error: text(data.error) || 'Goods receiving failed.', code: 'receiving_failed' }, { status: response.status || 500 });
+  const stored = await env.DB.prepare(
+    `SELECT g.id, g.raw_json, po.status AS order_status FROM grvs g
+       LEFT JOIN purchase_orders po ON po.workspace_id = g.workspace_id AND po.id = g.purchase_order_id
+      WHERE g.workspace_id = ?1 AND g.id = ?2 LIMIT 1`
+  ).bind(workspaceId, receiptId).first<Row>();
+  if (!stored) return error(request, env, 500, 'KCP posted the GRV but could not reload its receipt.');
+  const storedRaw = object(stored.raw_json);
+  if (text(storedRaw.mobilePayloadFingerprint) !== payloadFingerprint) return error(request, env, 409, 'Another device received this purchase-order state first. Refresh the order before continuing.');
+  return json(request, env, receiptResult(stored, Boolean(data.duplicate), text(stored.order_status || preview.completionStatus)));
+}
+
+export const __test = { isReceivableStatus, lineOutstanding, normalizeRequestedEntries };

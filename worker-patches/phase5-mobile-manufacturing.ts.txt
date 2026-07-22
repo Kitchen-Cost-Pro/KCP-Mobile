@@ -1,0 +1,545 @@
+import type { AuthContext, Env } from './types';
+import { json, error, readJson } from './http';
+import { guardProtectedOperation } from './approval-engine';
+import {
+  assertWorkspaceAccess,
+  assertWorkspacePermission,
+  assertLocationAccess,
+  getUserAllowedLocationIds
+} from './auth';
+import { resolveLocationDisplayName } from './location-display';
+import { normalizeBarcode, barcodesEqual, splitBarcodeCsv } from './barcode-normalize';
+import { normalizeUomConfigurations, getManufacturingBatches, postManufacturingBatch } from './routes';
+
+type Row = Record<string, any>;
+
+function text(value: unknown, fallback = ''): string {
+  return String(value ?? fallback).trim();
+}
+
+function num(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function round3(value: number): number {
+  return Math.round((value + Number.EPSILON) * 1000) / 1000;
+}
+
+function computeProductionQuantities(batchYield: number, batchCount: number, actualQuantity: number) {
+  const expectedQuantity = round3(batchYield * batchCount);
+  const yieldVariance = round3(actualQuantity - expectedQuantity);
+  return { expectedQuantity, yieldVariance, wastageQuantity: round3(Math.max(expectedQuantity - actualQuantity, 0)) };
+}
+
+function aggregateRecipeRequirements(recipe: Array<{ stockItemId: string; quantity: number }>, batchCount: number) {
+  const requiredById = new Map<string, number>();
+  for (const line of recipe) requiredById.set(line.stockItemId, round3((requiredById.get(line.stockItemId) || 0) + line.quantity * batchCount));
+  return requiredById;
+}
+
+function parseJson(value: unknown): Row {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Row;
+  try {
+    const parsed = JSON.parse(String(value || '{}'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function array(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function manufacturedItemSql(alias = 'si') {
+  return `(REPLACE(REPLACE(lower(COALESCE(${alias}.item_type, json_extract(${alias}.raw_json, '$.itemType'), '')), '-', '_'), ' ', '_') IN ('manufactured', 'manufactured_item', 'manufactured_good', 'manufactured_goods', 'prep', 'prepared')
+    OR COALESCE(json_extract(${alias}.raw_json, '$.isManufactured'), json_extract(${alias}.raw_json, '$.is_manufactured'), 0) IN (1, 'true', 'yes')
+    OR lower(COALESCE(${alias}.category, '')) LIKE '%manufactured%')`;
+}
+
+function normalizeRawRecipe(value: unknown): Array<{ stockItemId: string; quantity: number; unit: string }> {
+  return array(value).map((entry) => parseJson(entry)).map((line) => ({
+    stockItemId: text(line.stockItemId || line.stock_item_id || line.ingId || line.ingredientId || line.id),
+    quantity: num(line.quantity ?? line.qty ?? line.amount, 0),
+    unit: text(line.unit || line.uom, 'ea') || 'ea'
+  })).filter((line) => line.stockItemId && line.quantity > 0);
+}
+
+async function loadRecipe(env: Env, workspaceId: string, itemId: string, rawRecipe: unknown) {
+  const recipe = await env.DB.prepare(
+    `SELECT id FROM recipes
+      WHERE workspace_id = ?1 AND owner_type = 'stock_item' AND owner_id = ?2 AND active = 1
+      LIMIT 1`
+  ).bind(workspaceId, itemId).first<{ id: string }>();
+  if (recipe?.id) {
+    const lines = await env.DB.prepare(
+      `SELECT stock_item_id, quantity, unit FROM recipe_lines
+        WHERE workspace_id = ?1 AND recipe_id = ?2
+        ORDER BY sort_order ASC`
+    ).bind(workspaceId, recipe.id).all<Row>();
+    const normalized = (lines.results || []).map((line) => ({
+      stockItemId: text(line.stock_item_id),
+      quantity: num(line.quantity, 0),
+      unit: text(line.unit, 'ea') || 'ea'
+    })).filter((line) => line.stockItemId && line.quantity > 0);
+    if (normalized.length) return normalized;
+  }
+  return normalizeRawRecipe(parseJson(rawRecipe).recipe || rawRecipe);
+}
+
+function safeItem(row: Row) {
+  const raw = parseJson(row.raw_json);
+  const baseUom = text(row.unit) || 'ea';
+  const baseBarcodes = splitBarcodeCsv(row.barcode_csv).map((value) => value.raw).filter(Boolean);
+  if (Array.isArray(raw.barcodes)) for (const value of raw.barcodes) if (normalizeBarcode(value).raw) baseBarcodes.push(normalizeBarcode(value).raw);
+  const uoms = [{ id: `${text(row.id)}:base`, name: baseUom, quantityInBase: 1, isBase: true, barcode: baseBarcodes[0] || null }];
+  for (const config of normalizeUomConfigurations(raw.uomConfigurations)) {
+    if (!text(config.customUom) || num(config.ratio, 0) <= 0) continue;
+    uoms.push({ id: `${text(row.id)}:${text(config.customUom)}`, name: text(config.customUom), quantityInBase: num(config.ratio), isBase: false, barcode: text(config.barcode) || null });
+  }
+  return {
+    id: text(row.id),
+    name: text(row.name),
+    sku: text(raw.sku || raw.customSku || raw.stockCode || raw.itemCode) || null,
+    category: text(row.category),
+    baseUom,
+    batchYield: num(row.batch_yield || raw.yieldBatch, 1) || 1,
+    uoms,
+    barcodes: [...new Set([...baseBarcodes, ...uoms.map((uom) => text(uom.barcode)).filter(Boolean)])]
+  };
+}
+
+async function findManufacturedItems(env: Env, workspaceId: string, search: string) {
+  const like = `%${search.replace(/[%_\\]/g, (value) => `\\${value}`)}%`;
+  const rows = await env.DB.prepare(
+    `SELECT si.id, si.name, si.unit, si.category, si.item_type, si.barcode_csv, si.batch_yield, si.raw_json
+       FROM stock_items si
+      WHERE si.workspace_id = ?1 AND si.active = 1
+        AND ${manufacturedItemSql('si')}
+        AND (si.name LIKE ?2 ESCAPE '\\' OR si.category LIKE ?2 ESCAPE '\\' OR si.barcode_csv LIKE ?2 ESCAPE '\\' OR si.raw_json LIKE ?2 ESCAPE '\\')
+      ORDER BY CASE WHEN lower(si.name) = lower(?3) THEN 0 ELSE 1 END, lower(si.name)
+      LIMIT 30`
+  ).bind(workspaceId, like, search).all<Row>();
+  const output: Array<ReturnType<typeof safeItem>> = [];
+  for (const row of rows.results || []) {
+    const recipe = await loadRecipe(env, workspaceId, text(row.id), parseJson(row.raw_json).recipe);
+    if (recipe.length) output.push(safeItem(row));
+  }
+  return output;
+}
+
+async function loadManufacturedCatalog(env: Env, workspaceId: string) {
+  const rows = await env.DB.prepare(
+    `SELECT si.id, si.name, si.unit, si.category, si.item_type, si.barcode_csv, si.batch_yield, si.raw_json
+       FROM stock_items si
+      WHERE si.workspace_id = ?1 AND si.active = 1 AND ${manufacturedItemSql('si')}
+      ORDER BY lower(si.category), lower(si.name)`
+  ).bind(workspaceId).all<Row>();
+  const items = [];
+  for (const row of rows.results || []) {
+    const recipe = await loadRecipe(env, workspaceId, text(row.id), parseJson(row.raw_json).recipe);
+    items.push({ ...safeItem(row), hasBlueprint: recipe.length > 0, blueprintIssue: recipe.length ? null : 'Blueprint required' });
+  }
+  return items;
+}
+
+async function digest(value: unknown) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(hash)].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function buildPreview(env: Env, auth: AuthContext, workspaceId: string, input: Row) {
+  const manufacturedItemId = text(input.manufacturedItemId || input.itemId || input.stockItemId);
+  const locationId = text(input.locationId);
+  const batchCount = num(input.batchCount || input.batchMultiplier, 0);
+  const actualQuantity = num(input.actualQuantity || input.producedQty, 0);
+  if (!manufacturedItemId) throw new Error('Select a manufactured item first.');
+  if (!locationId) throw new Error('Choose a production location.');
+  if (!(batchCount > 0)) throw new Error('Batch count must be greater than zero.');
+  if (!(actualQuantity > 0)) throw new Error('Actual finished quantity must be greater than zero.');
+  if (batchCount > 10000 || actualQuantity > 1000000000) throw new Error('The production quantity is outside the supported mobile range.');
+  await assertLocationAccess(env, auth, workspaceId, locationId, 'manufacturing');
+
+  const location = await env.DB.prepare(
+    `SELECT id, name, display_name, external_name, is_default, kind, active, raw_json
+       FROM locations WHERE workspace_id = ?1 AND id = ?2 AND active = 1 LIMIT 1`
+  ).bind(workspaceId, locationId).first<Row>();
+  if (!location) throw new Error('That production location is unavailable.');
+
+  const item = await env.DB.prepare(
+    `SELECT si.id, si.name, si.unit, si.category, si.item_type, si.barcode_csv, si.batch_yield, si.raw_json
+       FROM stock_items si
+      WHERE si.workspace_id = ?1 AND si.id = ?2 AND si.active = 1 AND ${manufacturedItemSql('si')}
+      LIMIT 1`
+  ).bind(workspaceId, manufacturedItemId).first<Row>();
+  if (!item) throw new Error('Manufactured item could not be found.');
+  const raw = parseJson(item.raw_json);
+  const recipe = await loadRecipe(env, workspaceId, manufacturedItemId, raw.recipe);
+  if (!recipe.length) throw new Error('This manufactured item has no blueprint ingredients yet.');
+  const batchYield = num(item.batch_yield || raw.yieldBatch, 1) || 1;
+  const { expectedQuantity, yieldVariance, wastageQuantity } = computeProductionQuantities(batchYield, batchCount, actualQuantity);
+  const requiredById = aggregateRecipeRequirements(recipe, batchCount);
+  const ids = [...requiredById.keys()];
+  const placeholders = ids.map((_, index) => `?${index + 3}`).join(', ');
+  const rows = await env.DB.prepare(
+    `SELECT si.id, si.name, si.unit, COALESCE(sb.quantity, 0) AS on_hand
+       FROM stock_items si
+       LEFT JOIN stock_balances sb ON sb.workspace_id = si.workspace_id AND sb.stock_item_id = si.id AND sb.location_id = ?2
+      WHERE si.workspace_id = ?1 AND si.active = 1 AND si.id IN (${placeholders})`
+  ).bind(workspaceId, locationId, ...ids).all<Row>();
+  const byId = new Map((rows.results || []).map((row) => [text(row.id), row]));
+  const components = ids.map((id) => {
+    const row = byId.get(id);
+    const requiredQuantity = requiredById.get(id) || 0;
+    const onHand = num(row?.on_hand, 0);
+    return {
+      stockItemId: id,
+      name: text(row?.name) || 'Unavailable ingredient',
+      unit: text(row?.unit) || recipe.find((line) => line.stockItemId === id)?.unit || 'ea',
+      requiredQuantity,
+      onHand,
+      remainingQuantity: round3(onHand - requiredQuantity),
+      available: Boolean(row) && onHand >= requiredQuantity
+    };
+  });
+  const blockingErrors = components.filter((component) => !component.available).map((component) => component.name === 'Unavailable ingredient'
+    ? 'A blueprint ingredient is inactive or unavailable.'
+    : `Not enough ${component.name}. Available ${component.onHand} ${component.unit}; required ${component.requiredQuantity} ${component.unit}.`);
+  const previewData = {
+    manufacturedItemId,
+    locationId,
+    batchCount: round3(batchCount),
+    expectedQuantity,
+    actualQuantity: round3(actualQuantity),
+    recipe: components.map((component) => [component.stockItemId, component.requiredQuantity, component.onHand])
+  };
+  return {
+    item: safeItem(item),
+    location: { id: locationId, name: resolveLocationDisplayName(location), kind: text(location.kind) || 'selling' },
+    batchCount: round3(batchCount),
+    expectedQuantity,
+    actualQuantity: round3(actualQuantity),
+    yieldVariance,
+    wastageQuantity,
+    components,
+    blockingErrors,
+    previewToken: await digest(previewData),
+    previewedAt: new Date().toISOString()
+  };
+}
+
+function aggregateComponentPreviews(products: Row[]): Row[] {
+  const aggregate = new Map<string, Row>();
+  for (const product of products) for (const component of array(product.components).map(parseJson)) {
+    const id = text(component.stockItemId);
+    const current = aggregate.get(id);
+    aggregate.set(id, current ? { ...current, requiredQuantity: round3(num(current.requiredQuantity) + num(component.requiredQuantity)) } : { ...component });
+  }
+  return [...aggregate.values()].map((component): Row => ({
+    ...component,
+    remainingQuantity: round3(num(component.onHand) - num(component.requiredQuantity)),
+    available: num(component.onHand) >= num(component.requiredQuantity)
+  }));
+}
+
+function validatedRunEntries(input: Row) {
+  const entries = array(input.entries).map(parseJson).filter((entry) => num(entry.batchCount) > 0 || num(entry.actualQuantity) > 0);
+  if (!entries.length) throw new Error('Enter production for at least one manufactured item.');
+  if (entries.length > 200) throw new Error('A mobile production run supports up to 200 manufactured items.');
+  const ids = entries.map((entry) => text(entry.manufacturedItemId || entry.itemId));
+  if (ids.some((id) => !id)) throw new Error('Every production entry must identify a manufactured item.');
+  if (new Set(ids).size !== ids.length) throw new Error('Each manufactured item may appear only once in a production run.');
+  return entries;
+}
+
+async function buildRunPreview(env: Env, auth: AuthContext, workspaceId: string, input: Row) {
+  const locationId = text(input.locationId);
+  if (!locationId) throw new Error('Choose a production location.');
+  const entries = validatedRunEntries(input);
+  const products: Row[] = [];
+  for (const entry of entries) products.push(await buildPreview(env, auth, workspaceId, { ...entry, locationId }));
+  const components = aggregateComponentPreviews(products);
+  const blockingErrors = components.filter((component) => !component.available).map((component) => `Not enough ${text(component.name)}. Available ${num(component.onHand)} ${text(component.unit)}; required ${num(component.requiredQuantity)} ${text(component.unit)}.`);
+  const tokenData = {
+    locationId,
+    entries: products.map((product) => [product.item.id, product.batchCount, product.actualQuantity, product.expectedQuantity]),
+    components: components.map((component) => [component.stockItemId, component.requiredQuantity, component.onHand])
+  };
+  return {
+    location: products[0].location,
+    products: products.map((product) => ({
+      item: product.item, batchCount: product.batchCount, expectedQuantity: product.expectedQuantity,
+      actualQuantity: product.actualQuantity, yieldVariance: product.yieldVariance, wastageQuantity: product.wastageQuantity,
+      previewToken: product.previewToken
+    })),
+    components,
+    blockingErrors,
+    previewToken: await digest(tokenData),
+    previewedAt: new Date().toISOString()
+  };
+}
+
+export async function getMobileManufacturingBootstrap(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  const allowed = await getUserAllowedLocationIds(env, auth, workspaceId);
+  const locationRows = await env.DB.prepare(
+    `SELECT id, name, display_name, external_name, is_default, kind, active, raw_json
+       FROM locations WHERE workspace_id = ?1 AND active = 1 ORDER BY lower(name)`
+  ).bind(workspaceId).all<Row>();
+  const locations = (locationRows.results || []).filter((row) => allowed === null || allowed.includes(text(row.id))).map((row) => ({
+    id: text(row.id), name: resolveLocationDisplayName(row), kind: text(row.kind) || 'selling', isDefault: Boolean(row.is_default)
+  }));
+
+  const inner = new Request(`https://do/api/workspaces/${encodeURIComponent(workspaceId)}/manufacturing-batches?limit=100`, { method: 'GET' });
+  const response = await getManufacturingBatches(inner, env, auth, workspaceId);
+  const data = await response.json().catch(() => ({})) as Row;
+  const recentBatches = (Array.isArray(data.batches) ? data.batches : []).filter((batch: Row) => allowed === null || allowed.includes(text(batch.locationId))).slice(0, 25).map((batch: Row) => ({
+    id: text(batch.id),
+    transactionReference: text(batch.transactionReference),
+    itemId: text(batch.itemId),
+    itemName: text(batch.itemName),
+    locationId: text(batch.locationId),
+    locationName: text(batch.locationName),
+    expectedQuantity: num(batch.expectedQty, 0),
+    actualQuantity: num(batch.producedQty, 0),
+    wastageQuantity: num(batch.wastageQty, 0),
+    unit: text(batch.unit),
+    note: text(batch.note),
+    postedAt: text(batch.timestamp || batch.createdAt),
+    createdByName: text(batch.createdByName || batch.user)
+  }));
+  return json(request, env, { ok: true, apiVersion: 'mobile-v1', workspaceId, locations, canCreateBatch: locations.length > 0, recentBatches });
+}
+
+export async function getMobileManufacturingItems(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  const url = new URL(request.url);
+  const locationId = text(url.searchParams.get('locationId'));
+  const search = text(url.searchParams.get('search')).slice(0, 100);
+  if (!locationId) return error(request, env, 400, 'Choose a production location before searching.');
+  if (search.length < 2) return error(request, env, 400, 'Enter at least two characters to search.');
+  await assertLocationAccess(env, auth, workspaceId, locationId, 'manufacturing');
+  return json(request, env, { ok: true, items: await findManufacturedItems(env, workspaceId, search) });
+}
+
+export async function getMobileManufacturingCatalog(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  const locationId = text(new URL(request.url).searchParams.get('locationId'));
+  if (!locationId) return error(request, env, 400, 'Choose a production location before loading manufactured items.');
+  await assertLocationAccess(env, auth, workspaceId, locationId, 'manufacturing_catalog');
+  return json(request, env, { ok: true, workspaceId, locationId, items: await loadManufacturedCatalog(env, workspaceId) });
+}
+
+export async function getMobileManufacturingBarcode(request: Request, env: Env, auth: AuthContext, workspaceId: string, barcodeParam: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  const locationId = text(new URL(request.url).searchParams.get('locationId'));
+  if (!locationId) return error(request, env, 400, 'Choose a production location before scanning.');
+  await assertLocationAccess(env, auth, workspaceId, locationId, 'manufacturing');
+  const scanned = normalizeBarcode(decodeURIComponent(barcodeParam || ''));
+  if (!scanned.raw) return error(request, env, 400, 'A barcode is required.');
+  const candidates = await findManufacturedItems(env, workspaceId, scanned.raw);
+  const matches = candidates.filter((item) => item.barcodes.some((barcode) => barcodesEqual(barcode, scanned.raw)));
+  if (!matches.length) return json(request, env, { ok: true, matched: false, reason: 'not_found', barcode: scanned.raw });
+  if (matches.length > 1) return json(request, env, { ok: true, matched: false, reason: 'ambiguous', barcode: scanned.raw, candidates: matches.slice(0, 5).map((item) => ({ id: item.id, name: item.name })) });
+  return json(request, env, { ok: true, matched: true, barcode: scanned.raw, item: matches[0] });
+}
+
+export async function postMobileManufacturingPreview(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  try {
+    const preview = await buildPreview(env, auth, workspaceId, await readJson<Row>(request));
+    return json(request, env, { ok: true, ...preview });
+  } catch (cause) {
+    return error(request, env, 400, cause instanceof Error ? cause.message : 'Manufacturing preview failed.');
+  }
+}
+
+export async function postMobileManufacturingBatch(request: Request, env: Env, auth: AuthContext, workspaceId: string, approvedShortage = false) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  const body = await readJson<Row>(request);
+  if (body.confirm !== true) return error(request, env, 400, 'Explicit confirmation is required.');
+  const idempotencyKey = text(body.idempotencyKey || body.clientBatchId || body.clientActionId);
+  if (!idempotencyKey) return error(request, env, 400, 'An idempotency key is required.');
+
+  const existing = await env.DB.prepare(
+    `SELECT id, raw_json FROM manufacturing_batches WHERE workspace_id = ?1 AND id = ?2 LIMIT 1`
+  ).bind(workspaceId, idempotencyKey).first<Row>();
+  if (existing) {
+    const raw = parseJson(existing.raw_json);
+    return json(request, env, {
+      ok: true, duplicate: true, batchId: idempotencyKey, transactionReference: text(raw.transactionReference),
+      itemName: text(raw.itemName), locationName: text(raw.locationName), expectedQuantity: num(raw.expectedQty),
+      actualQuantity: num(raw.producedQty), wastageQuantity: num(raw.wastageQty), unit: text(raw.unit), postedAt: text(raw.timestamp)
+    });
+  }
+
+  let preview;
+  try {
+    preview = await buildPreview(env, auth, workspaceId, body);
+  } catch (cause) {
+    return error(request, env, 400, cause instanceof Error ? cause.message : 'Manufacturing validation failed.');
+  }
+  if (preview.blockingErrors.length && !approvedShortage) return json(request, env, { ok: false, error: 'Component stock is insufficient.', code: 'insufficient_stock', blockingErrors: preview.blockingErrors }, { status: 409 });
+  if (!text(body.previewToken) || text(body.previewToken) !== preview.previewToken) {
+    return error(request, env, 409, 'Production inputs or component availability changed. Refresh the preview before posting.');
+  }
+
+  const inner = new Request(`https://do/api/workspaces/${encodeURIComponent(workspaceId)}/manufacturing-batches`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ batch: {
+      id: idempotencyKey,
+      manufacturedItemId: preview.item.id,
+      locationId: preview.location.id,
+      locationName: preview.location.name,
+      batchCount: preview.batchCount,
+      expectedQty: preview.expectedQuantity,
+      producedQty: preview.actualQuantity,
+      note: text(body.note),
+      date: text(body.occurredAt || new Date().toISOString()).slice(0, 10)
+    } })
+  });
+  const response = await postManufacturingBatch(inner, env, auth, workspaceId);
+  const data = await response.json().catch(() => ({})) as Row;
+  if (!response.ok || data.ok === false) return json(request, env, { ok: false, error: text(data.error) || 'Manufacturing batch failed.', code: 'manufacturing_failed' }, { status: response.status || 500 });
+  const batch = parseJson(data.batch);
+  return json(request, env, {
+    ok: true, duplicate: Boolean(data.duplicate), batchId: text(data.id) || idempotencyKey,
+    transactionReference: text(data.transactionReference || batch.transactionReference), itemName: text(batch.itemName || preview.item.name),
+    locationName: text(batch.locationName || preview.location.name), expectedQuantity: num(batch.expectedQty, preview.expectedQuantity),
+    actualQuantity: num(batch.producedQty, preview.actualQuantity), wastageQuantity: num(batch.wastageQty, preview.wastageQuantity),
+    unit: text(batch.unit || preview.item.baseUom), componentCount: preview.components.length, postedAt: text(batch.timestamp) || new Date().toISOString()
+  });
+}
+
+export async function postMobileManufacturingRunPreview(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  try {
+    return json(request, env, { ok: true, ...(await buildRunPreview(env, auth, workspaceId, await readJson<Row>(request))) });
+  } catch (cause) {
+    return error(request, env, 400, cause instanceof Error ? cause.message : 'Production run preview failed.');
+  }
+}
+
+export async function postMobileManufacturingRun(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-mfg-products');
+  const body = await readJson<Row>(request);
+  if (body.confirm !== true) return error(request, env, 400, 'Explicit confirmation is required.');
+  const runId = text(body.idempotencyKey || body.runId || body.clientRunId);
+  if (!runId) return error(request, env, 400, 'A production run ID is required.');
+  const locationId = text(body.locationId);
+  const suppliedToken = text(body.previewToken);
+  let sourceEntries: Row[];
+  try { sourceEntries = validatedRunEntries(body); }
+  catch (cause) { return error(request, env, 400, cause instanceof Error ? cause.message : 'Production run validation failed.'); }
+  if (!locationId) return error(request, env, 400, 'Choose a production location.');
+  if (!suppliedToken) return error(request, env, 409, 'Refresh the run preview before posting.');
+
+  // Bind every child batch ID to the exact reviewed payload. On a retry, any changed
+  // product, quantity, note, location or preview token produces a different fingerprint.
+  const fingerprint = await digest({
+    runId, suppliedToken, locationId,
+    entries: sourceEntries.map((entry) => [
+      text(entry.manufacturedItemId || entry.itemId), round3(num(entry.batchCount)),
+      round3(num(entry.actualQuantity)), text(entry.note)
+    ])
+  });
+  const childIds = sourceEntries.map((_, index) => `${runId.slice(0, 64)}:${fingerprint.slice(0, 24)}:${index + 1}`);
+  const existing = new Map<number, Row>();
+  for (let index = 0; index < childIds.length; index += 1) {
+    const row = await env.DB.prepare(
+      `SELECT id, raw_json FROM manufacturing_batches WHERE workspace_id = ?1 AND id = ?2 LIMIT 1`
+    ).bind(workspaceId, childIds[index]).first<Row>();
+    if (!row) continue;
+    const raw = parseJson(row.raw_json);
+    const source = sourceEntries[index];
+    if (text(raw.itemId) !== text(source.manufacturedItemId || source.itemId)
+      || text(raw.locationId) !== locationId
+      || round3(num(raw.batchCount)) !== round3(num(source.batchCount))
+      || round3(num(raw.producedQty)) !== round3(num(source.actualQuantity))) {
+      return error(request, env, 409, 'This production run ID is already attached to different production values. Start a new run.');
+    }
+    existing.set(index, { ...row, raw });
+  }
+
+  const pending = sourceEntries.filter((_, index) => !existing.has(index));
+  let pendingPreview: Row | null = null;
+  if (pending.length) {
+    try { pendingPreview = await buildRunPreview(env, auth, workspaceId, { locationId, entries: pending }); }
+    catch (cause) { return error(request, env, 400, cause instanceof Error ? cause.message : 'Production run validation failed.'); }
+    if (!existing.size && suppliedToken !== text(pendingPreview.previewToken)) {
+      return error(request, env, 409, 'Production inputs or component availability changed. Refresh the run preview before posting.');
+    }
+  }
+
+  if (!existing.size && pendingPreview) {
+    const products = array(pendingPreview.products).map(parseJson);
+    const maximumYieldLossPercent = products.reduce((maximum, product) => Math.max(maximum, num(product.expectedQuantity) > 0 ? Math.max(num(product.expectedQuantity) - num(product.actualQuantity), 0) / num(product.expectedQuantity) * 100 : 0), 0);
+    const shortages = array(pendingPreview.components).map(parseJson).filter((component) => !component.available);
+    const exceptionMetric = Math.max(maximumYieldLossPercent, shortages.length ? 100 : 0);
+    const approval = await guardProtectedOperation(request, env, auth, workspaceId, {
+      operationType: 'manufacturing_exception', idempotencyKey: runId, title: shortages.length ? 'Manufacturing shortage exception' : 'Manufacturing yield exception',
+      summary: `${products.length} products at ${text(parseJson(pendingPreview.location).name || locationId)}`,
+      locationId, locationName: text(parseJson(pendingPreview.location).name || locationId), amount: null, currency: 'ZAR', metricValue: exceptionMetric,
+      detail: { productCount: products.length, maximumYieldLossPercent: round3(maximumYieldLossPercent), shortages: shortages.map((component) => ({ name: text(component.name), required: num(component.requiredQuantity), onHand: num(component.onHand), unit: text(component.unit) })), products: products.map((product) => ({ name: text(parseJson(product.item).name), expected: num(product.expectedQuantity), actual: num(product.actualQuantity), loss: num(product.wastageQuantity) })) },
+      executionResource: 'manufacturing/runs/commit', executionMethod: 'POST'
+    }, body);
+    if (!approval.proceed) return approval.response!;
+    if (shortages.length && !approval.approvalRequestId) return json(request, env, { ok: false, error: 'Component stock is insufficient and no matching approval policy is active.', code: 'insufficient_stock', blockingErrors: pendingPreview.blockingErrors }, { status: 409 });
+  }
+
+  const batches: Row[] = [];
+  for (let index = 0; index < sourceEntries.length; index += 1) {
+    const source = sourceEntries[index];
+    const childId = childIds[index];
+    const alreadyPosted = existing.get(index);
+    if (alreadyPosted) {
+      const raw = parseJson(alreadyPosted.raw);
+      batches.push({
+        ok: true, duplicate: true, batchId: childId, transactionReference: text(raw.transactionReference),
+        itemName: text(raw.itemName), locationName: text(raw.locationName), expectedQuantity: num(raw.expectedQty),
+        actualQuantity: num(raw.producedQty), wastageQuantity: num(raw.wastageQty), unit: text(raw.unit),
+        componentCount: array(raw.components).length, postedAt: text(raw.timestamp)
+      });
+      continue;
+    }
+
+    // Each standard KCP Manufacturing batch is checked against the balance left by the
+    // previous child. This keeps shared-component runs correct while preserving the
+    // existing atomic per-product ledger transaction.
+    let childPreview;
+    try { childPreview = await buildPreview(env, auth, workspaceId, { ...source, locationId }); }
+    catch (cause) { return json(request, env, { ok: false, error: cause instanceof Error ? cause.message : 'Production run could not be completed.', code: 'run_incomplete', runId, completedBatches: batches, retrySafe: true }, { status: 409 }); }
+    const approvedShortage = Boolean(text(body.approvalRequestId) && text(body.approvalExecutionToken));
+    if (childPreview.blockingErrors.length && !approvedShortage) return json(request, env, { ok: false, error: 'Component stock changed while this run was posting.', code: 'run_incomplete', runId, completedBatches: batches, blockingErrors: childPreview.blockingErrors, retrySafe: true }, { status: 409 });
+    const childRequest = new Request('https://do/mobile/manufacturing/batches', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        idempotencyKey: childId, manufacturedItemId: childPreview.item.id, locationId,
+        batchCount: childPreview.batchCount, actualQuantity: childPreview.actualQuantity, previewToken: childPreview.previewToken,
+        note: text(source.note || body.note), occurredAt: text(body.occurredAt), confirm: true
+      })
+    });
+    const response = await postMobileManufacturingBatch(childRequest, env, auth, workspaceId, approvedShortage);
+    const data = await response.json().catch(() => ({})) as Row;
+    if (!response.ok || data.ok === false) return json(request, env, { ok: false, error: text(data.error) || 'Production run could not be completed.', code: 'run_incomplete', runId, completedBatches: batches, retrySafe: true }, { status: response.status || 500 });
+    batches.push(data);
+  }
+
+  const firstExistingRaw = existing.size ? parseJson(existing.values().next().value?.raw) : {};
+  const location = pendingPreview ? parseJson(pendingPreview.location) : { id: locationId, name: text(firstExistingRaw.locationName), kind: 'production' };
+  const componentIds = new Set<string>();
+  for (const value of existing.values()) for (const component of array(parseJson(value.raw).components).map(parseJson)) componentIds.add(text(component.ingId || component.stockItemId));
+  for (const component of array(pendingPreview?.components).map(parseJson)) componentIds.add(text(component.stockItemId));
+  componentIds.delete('');
+  return json(request, env, { ok: true, runId, duplicate: existing.size === sourceEntries.length, location, productCount: batches.length, componentCount: componentIds.size, batches, postedAt: new Date().toISOString() });
+}
+
+export const __test = { normalizeRawRecipe, computeProductionQuantities, aggregateRecipeRequirements, aggregateComponentPreviews, validatedRunEntries };

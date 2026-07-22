@@ -1,0 +1,3 @@
+[
+  {"id":"action-manage-user-actions","label":"Manage KCP User Actions","description":"Configure Role Sets, Action Groups, availability and responsibility routing. This never grants location access or security permissions."}
+]

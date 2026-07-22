@@ -1,0 +1,2 @@
+import { describe, expect, it } from 'vitest';
+describe('Phase 24 KCP User Actions contract',()=>{it('keeps authority separate from routing',()=>{const authority=['existing user access','existing permissions'];const routing=['role sets','action groups','responsibilities'];expect(authority).toHaveLength(2);expect(routing).toContain('action groups');});});

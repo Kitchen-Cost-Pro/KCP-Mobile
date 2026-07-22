@@ -1,0 +1,9 @@
+{
+  "actions": [
+    { "id": "action-manage-notifications", "label": "Dispatch operational notifications" }
+  ],
+  "recommendedDefaultRoles": {
+    "owner": ["action-manage-notifications"],
+    "admin": ["action-manage-notifications"]
+  }
+}

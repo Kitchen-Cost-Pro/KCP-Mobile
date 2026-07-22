@@ -1,0 +1,72 @@
+// ============================================================================
+// GET .../transfers/items — transfer-scoped item search and source balance
+// ============================================================================
+export async function getMobileTransferItems(
+  request: Request,
+  env: Env,
+  auth: AuthContext,
+  workspaceId: string
+): Promise<Response> {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-transfers');
+
+  const url = new URL(request.url);
+  const sourceLocationId = text(url.searchParams.get('sourceLocationId'));
+  const search = text(url.searchParams.get('search')).slice(0, 100);
+  if (!sourceLocationId) return error(request, env, 400, 'Choose a source location before searching stock.');
+  if (search.length < 2) return error(request, env, 400, 'Enter at least two characters to search.');
+  await assertLocationAccess(env, auth, workspaceId, sourceLocationId, 'transfer_source');
+
+  const like = `%${search.replace(/[%_\\]/g, (value) => `\\${value}`)}%`;
+  const rows = await env.DB.prepare(
+    `SELECT si.id, si.name, si.unit, si.category, si.barcode_csv, si.raw_json,
+            COALESCE(sb.quantity, 0) AS on_hand
+       FROM stock_items si
+       LEFT JOIN stock_balances sb
+         ON sb.workspace_id = si.workspace_id
+        AND sb.stock_item_id = si.id
+        AND sb.location_id = ?2
+      WHERE si.workspace_id = ?1
+        AND si.active = 1
+        AND COALESCE(si.is_stocked, 1) != 0
+        AND (si.name LIKE ?3 ESCAPE '\\'
+          OR si.category LIKE ?3 ESCAPE '\\'
+          OR si.barcode_csv LIKE ?3 ESCAPE '\\'
+          OR si.raw_json LIKE ?3 ESCAPE '\\')
+      ORDER BY CASE WHEN lower(si.name) = lower(?4) THEN 0 ELSE 1 END, lower(si.name)
+      LIMIT 30`
+  ).bind(workspaceId, sourceLocationId, like, search).all<Row>();
+
+  const items = (rows.results || []).map((row) => {
+    const raw = parseJson(row.raw_json);
+    const baseUom = text(row.unit) || 'ea';
+    const configs = normalizeUomConfigurations(raw.uomConfigurations);
+    const baseBarcodes = text(row.barcode_csv).split(',').map((value) => text(value)).filter(Boolean);
+    if (Array.isArray(raw.barcodes)) {
+      for (const value of raw.barcodes) if (text(value)) baseBarcodes.push(text(value));
+    }
+    const uoms = [{ id: `${text(row.id)}:base`, name: baseUom, quantityInBase: 1, isBase: true, barcode: baseBarcodes[0] || null }];
+    for (const config of configs) {
+      if (!text(config.customUom) || num(config.ratio, 0) <= 0) continue;
+      uoms.push({
+        id: `${text(row.id)}:${text(config.customUom)}`,
+        name: text(config.customUom),
+        quantityInBase: num(config.ratio, 0),
+        isBase: false,
+        barcode: text(config.barcode) || null
+      });
+    }
+    return {
+      id: text(row.id),
+      name: text(row.name),
+      sku: text(raw.sku || raw.customSku || raw.stockCode || raw.itemCode) || null,
+      category: text(row.category),
+      baseUom,
+      uoms,
+      barcodes: [...new Set([...baseBarcodes, ...uoms.map((uom) => text(uom.barcode)).filter(Boolean)])],
+      onHand: num(row.on_hand, 0)
+    };
+  });
+
+  return json(request, env, { ok: true, apiVersion: 'mobile-v1', sourceLocationId, items });
+}

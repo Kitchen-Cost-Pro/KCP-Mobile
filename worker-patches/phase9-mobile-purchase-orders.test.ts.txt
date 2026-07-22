@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { __test } from '../src/legacy/mobile-purchase-orders';
+
+const { lineProgress, normalizeOrderEntries, statusBucket } = __test;
+
+test('derives receiving progress without supplier-item restrictions', () => {
+  assert.deepEqual(lineProgress(10, 0), { orderedQuantity: 10, receivedQuantity: 0, remainingQuantity: 10, lineStatus: 'awaiting' });
+  assert.deepEqual(lineProgress(10, 4), { orderedQuantity: 10, receivedQuantity: 4, remainingQuantity: 6, lineStatus: 'partial' });
+  assert.deepEqual(lineProgress(10, 10), { orderedQuantity: 10, receivedQuantity: 10, remainingQuantity: 0, lineStatus: 'completed' });
+});
+
+test('normalizes positive unique order entries', () => {
+  assert.deepEqual(normalizeOrderEntries([{ stockItemId: 'item-1', quantity: '2.5', note: 'Weekly' }, { stockItemId: 'item-2', quantity: 0 }]), [{ stockItemId: 'item-1', quantity: 2.5, note: 'Weekly' }]);
+  assert.throws(() => normalizeOrderEntries([{ stockItemId: 'item-1', quantity: 1 }, { stockItemId: 'item-1', quantity: 2 }]), /only once/);
+});
+
+test('groups purchase-order lifecycle states for mobile', () => {
+  assert.equal(statusBucket('draft'), 'drafts');
+  assert.equal(statusBucket('sent'), 'sent');
+  assert.equal(statusBucket('partially_received'), 'partial');
+  assert.equal(statusBucket('completed'), 'completed');
+});

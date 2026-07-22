@@ -1,0 +1,21 @@
+/**
+ * Shared KCP barcode contract.
+ *
+ * Retail UPC-A is stored and resolved as EAN-13 in KCP, which means a
+ * twelve-digit numeric scan gains one leading zero. Other values are left
+ * untouched so Code 128 and internal barcode formats remain exact.
+ */
+export function normalizeBarcode(value: unknown) {
+  const raw = String(value ?? '').normalize('NFKC').trim().replace(/[\s\u200B-\u200D\uFEFF]+/g, '');
+  return { raw: /^\d{12}$/.test(raw) ? `0${raw}` : raw };
+}
+
+export function barcodesEqual(left: unknown, right: unknown) {
+  const a = normalizeBarcode(left).raw;
+  const b = normalizeBarcode(right).raw;
+  return Boolean(a && b && a === b);
+}
+
+export function splitBarcodeCsv(value: unknown) {
+  return String(value ?? '').split(',').map(normalizeBarcode).filter((barcode) => Boolean(barcode.raw));
+}

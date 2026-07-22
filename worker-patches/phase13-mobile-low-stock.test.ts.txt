@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { __test } from '../src/legacy/mobile-low-stock';
+
+test('uses location levels and rounds shortages into supplier-independent purchase packs', () => {
+  const item = __test.buildLowStockItem({
+    id: 'stock-1', name: 'Tomatoes', unit: 'kg', category: 'Produce', barcode_csv: '600100', on_hand: 2,
+    raw_json: JSON.stringify({ sku: 'TOM-1', purchaseUom: 'case', uomConfigurations: [{ customUom: 'case', ratio: 5, barcode: '600105' }], locationSettings: [{ locationId: 'loc-1', lowStockThreshold: 4, parLevel: 12 }] })
+  }, 'loc-1');
+  assert.deepEqual(
+    { currentQuantity: item?.currentQuantity, threshold: item?.threshold, parLevel: item?.parLevel, shortageQuantity: item?.shortageQuantity, suggestedOrderQuantity: item?.suggestedOrderQuantity, purchaseUom: item?.purchaseUom, status: item?.status },
+    { currentQuantity: 2, threshold: 4, parLevel: 12, shortageQuantity: 10, suggestedOrderQuantity: 2, purchaseUom: 'case', status: 'below_par' }
+  );
+  assert.ok(item?.barcodes.includes('600100'));
+  assert.ok(item?.barcodes.includes('600105'));
+});
+
+test('separates out-of-stock and omits items at par or without configured levels', () => {
+  const out = __test.buildLowStockItem({ id: 'a', name: 'Flour', unit: 'kg', on_hand: 0, raw_json: JSON.stringify({ lowStockThreshold: 3, parLevel: 8 }) }, 'loc-1');
+  assert.equal(out?.status, 'out_of_stock');
+  assert.equal(out?.suggestedOrderQuantity, 8);
+  assert.equal(__test.buildLowStockItem({ id: 'b', name: 'Milk', unit: 'l', on_hand: 8, raw_json: JSON.stringify({ parLevel: 8 }) }, 'loc-1'), null);
+  assert.equal(__test.buildLowStockItem({ id: 'c', name: 'Salt', unit: 'kg', on_hand: 0, raw_json: '{}' }, 'loc-1'), null);
+});

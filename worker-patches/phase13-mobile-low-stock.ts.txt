@@ -1,0 +1,133 @@
+import type { AuthContext, Env } from './types';
+import { json, error } from './http';
+import { assertWorkspaceAccess, assertWorkspacePermission, assertLocationAccess } from './auth';
+import { resolveLocationDisplayName } from './location-display';
+import { normalizeUomConfigurations } from './routes';
+import { normalizeBarcode, splitBarcodeCsv } from './barcode-normalize';
+
+type Row = Record<string, any>;
+
+function text(value: unknown, fallback = ''): string { return String(value ?? fallback).trim(); }
+function num(value: unknown, fallback = 0): number { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback; }
+function round3(value: number): number { return Math.round((value + Number.EPSILON) * 1000) / 1000; }
+function object(value: unknown): Row { if (value && typeof value === 'object' && !Array.isArray(value)) return value as Row; try { const parsed = JSON.parse(String(value || '{}')); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } }
+function array(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
+function key(value: unknown) { return text(value).normalize('NFKC').toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+function numeric(...values: unknown[]): number | null { for (const value of values) { if (value === '' || value === null || value === undefined) continue; const parsed = Number(value); if (Number.isFinite(parsed) && parsed >= 0) return parsed; } return null; }
+
+function locationLevels(raw: Row, locationId: string) {
+  const collections = [raw.locationSettings, raw.locationStockLevels, raw.stockLevelsByLocation, raw.locationLevels, raw.locationParLevels, raw.locationThresholds, raw.stockLevels, raw.parLevels];
+  for (const collection of collections) {
+    if (Array.isArray(collection)) {
+      const match = collection.map(object).find((entry) => key(entry.locationId || entry.location_id || entry.id || entry.location) === key(locationId));
+      if (match) return match;
+    } else if (collection && typeof collection === 'object') {
+      const record = object(collection);
+      const matchKey = Object.keys(record).find((candidate) => key(candidate) === key(locationId));
+      if (matchKey) return object(record[matchKey]);
+    }
+  }
+  return {};
+}
+
+function buildLowStockItem(row: Row, locationId: string) {
+  const raw = object(row.raw_json);
+  const location = locationLevels(raw, locationId);
+  const thresholdValue = numeric(
+    location.lowStockThreshold, location.low_stock_threshold, location.lowStockLevel, location.lowStockQuantity, location.lowStockAlertQty, location.reorderPoint, location.reorderLevel, location.minimumStockLevel, location.minimumLevel, location.minimumQuantity, location.minStock,
+    raw.lowStockThreshold, raw.low_stock_threshold, raw.lowStockLevel, raw.low_stock_level, raw.lowStockQuantity, raw.lowStockAlertQty, raw.reorderPoint, raw.reorder_point, raw.reorderLevel, raw.minimumStockLevel, raw.minimum_stock_level, raw.minimumLevel, raw.minimumQuantity, raw.minStock
+  );
+  const parValue = numeric(
+    location.parLevel, location.par_level, location.parStockLevel, location.parQuantity, location.par, location.targetStockLevel, location.targetQuantity, location.desiredStockLevel, location.maxStockLevel,
+    raw.parLevel, raw.par_level, raw.parStockLevel, raw.par_stock_level, raw.parQuantity, raw.par, raw.targetStockLevel, raw.target_stock_level, raw.targetQuantity, raw.desiredStockLevel, raw.maxStockLevel, raw.max_stock_level
+  );
+  const threshold = round3(Math.max(thresholdValue ?? parValue ?? 0, 0));
+  const parLevel = round3(Math.max(parValue ?? threshold, threshold));
+  if (!(parLevel > 0)) return null;
+  const currentQuantity = round3(num(row.on_hand, 0));
+  if (currentQuantity >= parLevel) return null;
+
+  const id = text(row.id);
+  const baseUom = text(row.unit, 'ea') || 'ea';
+  const configs = normalizeUomConfigurations(raw.uomConfigurations || raw.uomConfig || raw.uomConversions).map((config) => ({
+    name: text(config.customUom), quantityInBase: num(config.ratio, 0), barcode: text(config.barcode) || null
+  })).filter((config) => config.name && config.quantityInBase > 0);
+  const preferred = text(raw.purchaseUom || raw.purchase_uom || raw.orderingUom || raw.orderUom || raw.defaultPurchaseUom, baseUom) || baseUom;
+  const purchaseConfig = configs.find((entry) => key(entry.name) === key(preferred));
+  const purchaseUom = purchaseConfig?.name || (key(preferred) === key(baseUom) ? baseUom : preferred);
+  const packSize = round3(Math.max(purchaseConfig?.quantityInBase || num(raw.packSize ?? raw.pack_size, 1), 1));
+  const baseBarcodes = splitBarcodeCsv(row.barcode_csv).map((value) => value.raw).filter(Boolean);
+  for (const value of array(raw.barcodes)) if (normalizeBarcode(value).raw) baseBarcodes.push(normalizeBarcode(value).raw);
+  const uoms = [{ id: `${id}:base`, name: baseUom, quantityInBase: 1, isBase: true, barcode: baseBarcodes[0] || null }, ...configs.map((config) => ({ id: `${id}:${config.name}`, name: config.name, quantityInBase: config.quantityInBase, isBase: false, barcode: config.barcode }))];
+  const shortageQuantity = round3(Math.max(parLevel - currentQuantity, 0));
+  const suggestedOrderQuantity = Math.max(Math.ceil((shortageQuantity - Number.EPSILON) / packSize), 1);
+  return {
+    id,
+    name: text(row.name, 'Stock item'),
+    sku: text(raw.sku || raw.customSku || raw.stockCode || raw.itemCode) || null,
+    category: text(row.category, 'General') || 'General',
+    baseUom,
+    purchaseUom,
+    packSize,
+    barcodes: [...new Set([...baseBarcodes, ...uoms.map((uom) => text(uom.barcode)).filter(Boolean)])],
+    uoms,
+    currentQuantity,
+    threshold,
+    parLevel,
+    shortageQuantity,
+    suggestedOrderQuantity,
+    status: currentQuantity <= 0 ? 'out_of_stock' : 'below_par'
+  };
+}
+
+export async function getMobileLowStock(request: Request, env: Env, auth: AuthContext, workspaceId: string) {
+  await assertWorkspaceAccess(env, auth, workspaceId);
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-dashboard');
+  await assertWorkspacePermission(env, auth, workspaceId, 'nav-ingredients');
+  const url = new URL(request.url);
+  const locationId = text(url.searchParams.get('locationId'));
+  if (!locationId) return error(request, env, 400, 'Choose a location before loading low stock.');
+  await assertLocationAccess(env, auth, workspaceId, locationId, 'mobile_low_stock');
+  const location = await env.DB.prepare(
+    `SELECT id, name, display_name, external_name, kind, active, raw_json
+       FROM locations WHERE workspace_id = ?1 AND id = ?2 AND active = 1 LIMIT 1`
+  ).bind(workspaceId, locationId).first<Row>();
+  if (!location) return error(request, env, 404, 'The selected location is unavailable.');
+
+  const rows = await env.DB.prepare(
+    `SELECT si.id, si.name, si.unit, si.category, si.barcode_csv, si.raw_json,
+            COALESCE(sb.quantity, 0) AS on_hand
+       FROM stock_items si
+       LEFT JOIN stock_balances sb
+         ON sb.workspace_id = si.workspace_id
+        AND sb.stock_item_id = si.id
+        AND sb.location_id = ?2
+      WHERE si.workspace_id = ?1
+        AND si.active = 1
+        AND COALESCE(si.is_stocked, 1) != 0
+        AND REPLACE(REPLACE(LOWER(COALESCE(si.item_type, json_extract(si.raw_json, '$.itemType'), '')), '-', '_'), ' ', '_') NOT IN ('sub_recipe', 'subrecipe', 'virtual')
+        AND COALESCE(json_extract(si.raw_json, '$.isSubRecipe'), json_extract(si.raw_json, '$.is_sub_recipe'), 0) NOT IN (1, 'true', 'yes')
+      ORDER BY lower(si.category), lower(si.name)
+      LIMIT 5000`
+  ).bind(workspaceId, locationId).all<Row>();
+  const items = (rows.results || []).map((row) => buildLowStockItem(row, locationId)).filter(Boolean).sort((left: any, right: any) => {
+    if (left.status !== right.status) return left.status === 'out_of_stock' ? -1 : 1;
+    const severity = (right.shortageQuantity / Math.max(right.parLevel, 0.000001)) - (left.shortageQuantity / Math.max(left.parLevel, 0.000001));
+    return severity || left.name.localeCompare(right.name);
+  });
+  let canCreatePurchaseOrder = false;
+  try { await assertWorkspacePermission(env, auth, workspaceId, 'nav-purchase-orders'); canCreatePurchaseOrder = true; } catch { /* The list remains read-only. */ }
+  const outOfStock = items.filter((item: any) => item.status === 'out_of_stock').length;
+  return json(request, env, {
+    ok: true,
+    apiVersion: 'mobile-v1',
+    generatedAt: new Date().toISOString(),
+    workspaceId,
+    location: { id: locationId, name: resolveLocationDisplayName(location) },
+    canCreatePurchaseOrder,
+    counts: { total: items.length, outOfStock, belowPar: items.length - outOfStock },
+    items
+  });
+}
+
+export const __test = { buildLowStockItem, locationLevels };

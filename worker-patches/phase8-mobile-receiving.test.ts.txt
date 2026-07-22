@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { __test } from '../src/legacy/mobile-receiving';
+
+const { isReceivableStatus, lineOutstanding, normalizeRequestedEntries } = __test;
+
+test('allows sent and partially received orders but rejects terminal or draft orders', () => {
+  assert.equal(isReceivableStatus('sent'), true);
+  assert.equal(isReceivableStatus('partially_received'), true);
+  assert.equal(isReceivableStatus('draft'), false);
+  assert.equal(isReceivableStatus('completed'), false);
+  assert.equal(isReceivableStatus('cancelled'), false);
+});
+
+test('derives the remaining purchase-order quantity safely', () => {
+  assert.equal(lineOutstanding({ qty: 10, receivedQty: 4 }), 6);
+  assert.equal(lineOutstanding({ quantity: 10, receivedQty: 12 }), 0);
+  assert.equal(lineOutstanding({ qty: 10, receivedQty: 2, remainingQty: 3 }), 3);
+  assert.equal(lineOutstanding({ qty: 10, receivedQty: 2, remainingQty: null }), 8);
+});
+
+test('normalizes positive receipt lines and rejects duplicates', () => {
+  assert.deepEqual(normalizeRequestedEntries([
+    { lineId: 'line-1', receivedQuantity: '2.5', note: 'Good' },
+    { lineId: 'line-2', receivedQuantity: 0 }
+  ]), [{ lineId: 'line-1', receivedQuantity: 2.5, note: 'Good' }]);
+  assert.throws(() => normalizeRequestedEntries([
+    { lineId: 'line-1', receivedQuantity: 1 },
+    { lineId: 'line-1', receivedQuantity: 2 }
+  ]), /only once/);
+});

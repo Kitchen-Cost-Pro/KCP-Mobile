@@ -1,0 +1,56 @@
+import type { AuthContext, Env } from './types';
+import { error, json, readJson } from './http';
+import { assertWorkspaceAccess, assertWorkspacePermission } from './auth';
+
+type Row = Record<string, any>;
+const text = (value: unknown, fallback = '') => String(value ?? fallback).trim();
+const now = () => new Date().toISOString();
+
+/** Phase 21 policy and Phase 22 routing tables. All records are append-only. */
+export async function ensureRoutineRoutingSchema(env: Env) {
+  for (const statement of [
+    `CREATE TABLE IF NOT EXISTS routine_policies (routine_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, timezone TEXT NOT NULL DEFAULT 'Africa/Johannesburg', expected_minutes INTEGER, evidence_requirement TEXT NOT NULL DEFAULT 'checklist', approval_required INTEGER NOT NULL DEFAULT 0, escalation_json TEXT NOT NULL DEFAULT '{}', dependencies_json TEXT NOT NULL DEFAULT '[]', active_from TEXT, active_until TEXT, updated_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS routine_generation_history (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, routine_id TEXT NOT NULL, occurrence_key TEXT NOT NULL, action_id TEXT NOT NULL, assigned_type TEXT NOT NULL, assigned_id TEXT NOT NULL, location_id TEXT, generated_at TEXT NOT NULL, generator_version TEXT NOT NULL, UNIQUE(workspace_id,routine_id,occurrence_key,assigned_type,assigned_id,location_id))`,
+    `CREATE TABLE IF NOT EXISTS action_routing_history (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, action_id TEXT NOT NULL, event_type TEXT NOT NULL, actor_uid TEXT NOT NULL, reason TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS idx_routine_generation_history_action ON routine_generation_history(workspace_id,action_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_action_routing_history_action ON action_routing_history(workspace_id,action_id,created_at)`
+  ]) await env.DB.prepare(statement).run();
+}
+
+export async function workspaceTimezone(env: Env, workspaceId: string) {
+  // Supports both current and older KCP workspace setting layouts without failing generation.
+  for (const sql of [`SELECT timezone FROM workspace_settings WHERE workspace_id=?1 LIMIT 1`, `SELECT timezone FROM settings WHERE workspace_id=?1 LIMIT 1`]) {
+    try { const row = await env.DB.prepare(sql).bind(workspaceId).first<Row>(); if (text(row?.timezone)) return text(row?.timezone); } catch { /* table may not exist in an older workspace */ }
+  }
+  return 'Africa/Johannesburg';
+}
+export async function routineUtcDay(env: Env, workspaceId: string, clock = new Date()) {
+  const zone = await workspaceTimezone(env, workspaceId);
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(clock);
+  const value = (type: string) => parts.find((part) => part.type === type)?.value || '01';
+  return new Date(Date.UTC(Number(value('year')), Number(value('month')) - 1, Number(value('day'))));
+}
+export async function routineDueAt(env: Env, workspaceId: string, occurrence: string, time: string) {
+  const zone = await workspaceTimezone(env, workspaceId); const [year, month, day] = occurrence.split('-').map(Number); const [hour, minute] = text(time, '17:00').split(':').map(Number);
+  // Convert local wall clock to UTC using the timezone offset at the intended date; repeat once for DST correctness.
+  let candidate = Date.UTC(year, month - 1, day, hour || 0, minute || 0);
+  for (let pass = 0; pass < 2; pass++) { const rendered = new Intl.DateTimeFormat('en-CA', { timeZone: zone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).formatToParts(new Date(candidate)); const part = (type:string) => Number(rendered.find((item)=>item.type===type)?.value || 0); const local = Date.UTC(part('year'),part('month')-1,part('day'),part('hour'),part('minute')); candidate += Date.UTC(year,month-1,day,hour||0,minute||0) - local; }
+  return new Date(candidate).toISOString();
+}
+export async function saveRoutinePolicy(env: Env, workspaceId: string, routineId: string, payload: Row) {
+  await ensureRoutineRoutingSchema(env); const minutes = payload.expectedDurationMinutes == null || payload.expectedDurationMinutes === '' ? null : Number(payload.expectedDurationMinutes);
+  if (minutes != null && (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440)) throw new Error('Expected duration must be between 1 and 1,440 minutes.');
+  const dependencies = Array.isArray(payload.dependencies) ? payload.dependencies.map((item) => text(item)).filter(Boolean).slice(0, 30) : [];
+  const escalation = payload.escalation && typeof payload.escalation === 'object' ? payload.escalation : {};
+  await env.DB.prepare(`INSERT INTO routine_policies (routine_id,workspace_id,timezone,expected_minutes,evidence_requirement,approval_required,escalation_json,dependencies_json,active_from,active_until,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(routine_id) DO UPDATE SET timezone=excluded.timezone,expected_minutes=excluded.expected_minutes,evidence_requirement=excluded.evidence_requirement,approval_required=excluded.approval_required,escalation_json=excluded.escalation_json,dependencies_json=excluded.dependencies_json,active_from=excluded.active_from,active_until=excluded.active_until,updated_at=excluded.updated_at`).bind(routineId,workspaceId,text(payload.timezone) || await workspaceTimezone(env,workspaceId),minutes,text(payload.requiredEvidence,'checklist').slice(0,40),payload.approvalRequired===true?1:0,JSON.stringify(escalation),JSON.stringify(dependencies),text(payload.activeFrom)||null,text(payload.activeUntil)||null,now()).run();
+}
+export async function routinePolicy(env: Env, workspaceId: string, routineId: string) { await ensureRoutineRoutingSchema(env); return env.DB.prepare(`SELECT * FROM routine_policies WHERE workspace_id=?1 AND routine_id=?2`).bind(workspaceId,routineId).first<Row>(); }
+export async function recordRoutineGeneration(env: Env, workspaceId: string, routineId: string, occurrenceKey: string, actionId: string, assignment: Row, locationId: string) { await ensureRoutineRoutingSchema(env); await env.DB.prepare(`INSERT OR IGNORE INTO routine_generation_history (id,workspace_id,routine_id,occurrence_key,action_id,assigned_type,assigned_id,location_id,generated_at,generator_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'phase-21')`).bind(`routine-generation-${crypto.randomUUID()}`,workspaceId,routineId,occurrenceKey,actionId,text(assignment.target_type),text(assignment.target_id),locationId||null,now()).run(); }
+export async function enrichActionRouting(env: Env, workspaceId: string, action: Row, metadata: Row) {
+  const policy = await routinePolicy(env, workspaceId, text(action.template_id)); const dependencies = parseList(policy?.dependencies_json); const unresolved = dependencies.length ? await env.DB.prepare(`SELECT COUNT(*) count FROM task_instances WHERE workspace_id=?1 AND template_id IN (${dependencies.map((_, index)=>`?${index + 2}`).join(',')}) AND status!='completed'`).bind(workspaceId,...dependencies).first<Row>() : null;
+  const blocked = Number(unresolved?.count || 0) > 0; const due = new Date(text(action.due_at)); const overdue = due.getTime() < Date.now() && text(action.status) !== 'completed'; const reasons:string[]=[];
+  if(overdue) reasons.push('it is overdue'); if(text(action.assignment_type)==='role') reasons.push('it is assigned to your Role Set'); if(blocked) reasons.push('it is blocking a dependent routine');
+  return { estimatedMinutes: policy?.expected_minutes == null ? null : Number(policy.expected_minutes), confidence: 1, operationalRisk: overdue ? 'high' : 'normal', locationUrgency: overdue ? 15 : 0, blockingActionIds: blocked ? dependencies : [], approvalStatus: Number(policy?.approval_required)===1 && text(metadata.status)!=='completed' ? 'pending' : 'not_required', explanation: reasons.length ? `Shown first because ${reasons.join(', ')}.` : 'Shown according to KCP’s due-time, responsibility and operational-risk rules.' };
+}
+export async function postActionCancel(request: Request, env: Env, auth: AuthContext, workspaceId: string, actionId: string) { await assertWorkspaceAccess(env,auth,workspaceId); await assertWorkspacePermission(env,auth,workspaceId,'nav-tasks'); const body=await readJson<Row>(request); const reason=text(body.reason); if(!reason)return error(request,env,400,'A reason is required when cancelling an Action.'); const member=await env.CENTRAL_DB.prepare(`SELECT role FROM workspace_members WHERE workspace_id=?1 AND auth_uid=?2 AND status='active'`).bind(workspaceId,auth.uid).first<Row>(); if(!['owner','admin','superuser','super-user','manager'].includes(text(member?.role).toLowerCase()))return error(request,env,403,'Only managers can cancel an Action.'); await ensureRoutineRoutingSchema(env); const row=await env.DB.prepare(`SELECT template_id,status FROM task_instances WHERE workspace_id=?1 AND id=?2`).bind(workspaceId,actionId).first<Row>(); if(!row)return error(request,env,404,'Action not found.'); if(text(row.status)==='completed')return error(request,env,409,'Completed Actions cannot be cancelled.'); const timestamp=now(); await env.DB.batch([env.DB.prepare(`UPDATE task_instances SET status='cancelled',revision=revision+1,updated_at=?1 WHERE workspace_id=?2 AND id=?3`).bind(timestamp,workspaceId,actionId),env.DB.prepare(`UPDATE action_metadata SET status='cancelled',updated_at=?1 WHERE workspace_id=?2 AND action_id=?3`).bind(timestamp,workspaceId,actionId),env.DB.prepare(`INSERT INTO action_routing_history (id,workspace_id,action_id,event_type,actor_uid,reason,created_at) VALUES (?1,?2,?3,'cancelled',?4,?5,?6)`).bind(`action-routing-${crypto.randomUUID()}`,workspaceId,actionId,auth.uid,reason.slice(0,500),timestamp)]); return json(request,env,{ok:true,id:actionId,status:'cancelled'}); }
+function parseList(value: unknown) { try { const parsed=JSON.parse(text(value,'[]')); return Array.isArray(parsed)?parsed.map((item)=>text(item)).filter(Boolean):[]; } catch { return []; } }

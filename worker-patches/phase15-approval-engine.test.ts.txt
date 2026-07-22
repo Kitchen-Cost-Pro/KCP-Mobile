@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { __test } from '../src/legacy/approval-engine';
+
+test('selects value-bound multi-level approvals', () => {
+  const policy = { levels_json: JSON.stringify([{ level: 1, minValue: 0, roles: ['manager'] }, { level: 2, minValue: 50000, roles: ['owner'] }]) };
+  const levels = __test.applicableLevels(policy, 75000);
+  assert.equal(levels.length, 2);
+  assert.deepEqual(levels[1].roles, ['owner']);
+  assert.equal(__test.applicableLevels(policy, 1000).length, 1);
+});
+
+test('binds execution to the original payload', () => {
+  assert.deepEqual(__test.cleanPayload({ quantity: 2, approvalRequestId: 'a', approvalExecutionToken: 'secret' }), { quantity: 2 });
+});

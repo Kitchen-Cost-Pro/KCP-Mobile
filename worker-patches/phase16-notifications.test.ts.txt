@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { __test } from '../src/legacy/notifications';
+
+test('defaults missing preferences on and honours explicit opt-outs', () => {
+  assert.equal(__test.cleanPreferences({ taskAssigned: false }).taskAssigned, false);
+  assert.equal(__test.cleanPreferences({ taskAssigned: false }).lowStock, true);
+});
+
+test('resolves location-specific stock levels before workspace defaults', () => {
+  const raw = { lowStockThreshold: 2, parLevel: 6, locationLevels: { cape: { threshold: 5, par: 12 } } };
+  assert.deepEqual(__test.lowStockLevel(raw, 'cape'), { threshold: 5, par: 12 });
+  assert.deepEqual(__test.lowStockLevel(raw, 'joburg'), { threshold: 2, par: 6 });
+});

@@ -1,0 +1,13 @@
+{
+  "navigation": [{ "id": "nav-tasks", "label": "KCP Flow" }],
+  "actions": [{ "id": "action-manage-task-templates", "label": "Manage KCP Flow Routines" }],
+  "recommendedDefaultRoles": {
+    "manager": ["nav-tasks", "action-manage-task-templates"],
+    "member": ["nav-tasks"],
+    "storeman": ["nav-tasks"],
+    "prep": ["nav-tasks"],
+    "stocktaker": ["nav-tasks"],
+    "stocktracker": ["nav-tasks"],
+    "transfer-agent": ["nav-tasks"]
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "name": "kcp-mobile",
+  "version": "0.22.0",
+  "private": true,
+  "type": "module",
+  "description": "KCP Lite mobile client for Kitchen Cost Pro",
+  "engines": {
+    "node": ">=22 <25",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "check": "npm run typecheck && npm test && npm run build",
+    "api:verify": "node ./scripts/verify-mobile-api.mjs",
+    "worker:deploy": "bash ./scripts/deploy-current-worker.sh",
+    "cap:sync": "npm run build && cap sync",
+    "cap:android": "npm run cap:sync && cap open android",
+    "cap:ios": "npm run cap:sync && cap open ios",
+    "release:verify": "node ./scripts/verify-release-config.mjs",
+    "release:build": "bash ./scripts/build-production-releases.sh"
+  },
+  "dependencies": {
+    "@aparajita/capacitor-secure-storage": "8.0.0",
+    "@capacitor/android": "8.4.2",
+    "@capacitor/app": "8.1.1",
+    "@capacitor/barcode-scanner": "3.1.0",
+    "@capacitor/core": "8.4.2",
+    "@capacitor/filesystem": "8.1.2",
+    "@capacitor/ios": "8.4.2",
+    "@capacitor/network": "8.0.1",
+    "@capacitor/push-notifications": "^8.1.2",
+    "@capacitor/share": "8.0.1",
+    "@sentry/capacitor": "4.2.0",
+    "@sentry/react": "10.60.0",
+    "jspdf": "4.2.1",
+    "lucide-react": "1.25.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.4.2",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "jsdom": "29.1.1",
+    "typescript": "5.9.3",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
+  }
+}

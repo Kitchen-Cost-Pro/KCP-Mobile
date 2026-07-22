@@ -1,0 +1,6 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { __test } from '../src/legacy/role-sets';
+
+test('maps existing KCP roles to safe default Role Sets',()=>{ assert.equal(__test.fallback('prep'),'production-team'); assert.equal(__test.fallback('stocktaker'),'stock-controller'); assert.equal(__test.fallback('member'),'team-member'); assert.equal(__test.fallback('owner'),'owner-area-manager'); });
+test('escalates overdue priority and material financial impact deterministically',()=>{ const role={escalation:{afterMinutes:30,minimumPriority:'high',financialThreshold:500}}; assert.equal(__test.escalationFor({dueAt:'2026-07-21T08:00:00Z',priority:'high'},role,new Date('2026-07-21T08:31:00Z')).isEscalated,true); assert.equal(__test.escalationFor({dueAt:'2026-07-21T10:00:00Z',priority:'normal',financialImpact:{amount:600}},role,new Date('2026-07-21T08:00:00Z')).reason,'Material financial impact'); });

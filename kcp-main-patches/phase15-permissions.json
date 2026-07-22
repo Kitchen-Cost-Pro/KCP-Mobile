@@ -1,0 +1,12 @@
+{
+  "navigation": [{ "id": "nav-approvals", "label": "Approvals" }],
+  "actions": [
+    { "id": "action-approve-exceptions", "label": "Approve protected exceptions" },
+    { "id": "action-manage-approval-policies", "label": "Manage approval policies" }
+  ],
+  "recommendedDefaultRoles": {
+    "owner": ["nav-approvals", "action-approve-exceptions", "action-manage-approval-policies"],
+    "admin": ["nav-approvals", "action-approve-exceptions", "action-manage-approval-policies"],
+    "manager": ["nav-approvals", "action-approve-exceptions", "action-manage-approval-policies"]
+  }
+}

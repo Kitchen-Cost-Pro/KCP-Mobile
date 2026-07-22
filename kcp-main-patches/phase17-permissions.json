@@ -1,0 +1,8 @@
+{
+  "navigation": [{ "id": "nav-tasks", "label": "KCP Flow" }],
+  "actions": [{ "id": "action-manage-task-templates", "label": "Manage KCP Flow Routines" }],
+  "compatibility": {
+    "preservedPermissionIds": ["nav-tasks", "action-manage-task-templates"],
+    "reason": "Existing Role Sets keep their access without a permission migration."
+  }
+}

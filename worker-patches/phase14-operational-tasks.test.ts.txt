@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { __test } from '../src/legacy/operational-tasks';
+
+const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'legacy', 'operational-tasks.ts'), 'utf8');
+
+test('separates overdue, due today and completed work', () => {
+  const clock = new Date('2026-07-20T12:00:00.000Z');
+  assert.equal(__test.bucketFor({ status: 'open', due_at: '2026-07-19T17:00:00.000Z' }, clock), 'overdue');
+  assert.equal(__test.bucketFor({ status: 'open', due_at: '2026-07-20T17:00:00.000Z' }, clock), 'due_today');
+  assert.equal(__test.bucketFor({ status: 'completed', due_at: '2026-07-19T17:00:00.000Z' }, clock), 'completed');
+});
+
+test('generates daily, weekly and month-end-safe occurrences', () => {
+  assert.equal(__test.occurrenceDate({ recurrence: 'daily', start_date: '2026-01-01' }, new Date('2026-07-20T00:00:00Z')), '2026-07-20');
+  assert.equal(__test.occurrenceDate({ recurrence: 'weekly', weekday: 1, start_date: '2026-01-01' }, new Date('2026-07-20T00:00:00Z')), '2026-07-20');
+  assert.equal(__test.occurrenceDate({ recurrence: 'monthly', month_day: 31, start_date: '2026-01-01' }, new Date('2026-06-30T00:00:00Z')), '2026-06-30');
+});
+
+test('projects legacy rows into the KCP Flow status language', () => {
+  const clock = new Date('2026-07-20T12:00:00.000Z');
+  assert.equal(__test.actionStatusFor({ status: 'open', due_at: '2026-07-21T17:00:00.000Z' }, {}, 0, clock), 'upcoming');
+  assert.equal(__test.actionStatusFor({ status: 'open', due_at: '2026-07-20T17:00:00.000Z' }, {}, 0, clock), 'ready');
+  assert.equal(__test.actionStatusFor({ status: 'open', due_at: '2026-07-20T17:00:00.000Z' }, {}, 1, clock), 'in_progress');
+  assert.equal(__test.actionStatusFor({ status: 'completed', due_at: '2026-07-19T17:00:00.000Z' }, {}, 1, clock), 'completed');
+  assert.equal(__test.actionStatusFor({ status: 'open', due_at: '2026-07-20T17:00:00.000Z' }, { status: 'waiting' }, 0, clock), 'waiting');
+});
+
+test('uses one deterministic idempotency key for the same Routine event', () => {
+  const assignment = { target_type: 'role', target_id: 'manager', location_id: 'loc-1' };
+  assert.equal(__test.actionIdempotencyKey('routine-1', '2026-07-20', assignment), __test.actionIdempotencyKey('routine-1', '2026-07-20', assignment));
+  assert.notEqual(__test.actionIdempotencyKey('routine-1', '2026-07-20', assignment), __test.actionIdempotencyKey('routine-1', '2026-07-21', assignment));
+});
+
+test('Action role assignment uses the central role_key schema', () => {
+  assert.match(source, /SELECT role_key, display_name, email FROM workspace_members/);
+  assert.doesNotMatch(source, /SELECT role, display_name, email FROM workspace_members/);
+});

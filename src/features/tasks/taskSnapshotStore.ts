@@ -1,0 +1,7 @@
+import { ACTION_STATUSES, normalizeAction, type ActionsResponse } from '../flow/actionModel';
+const PREFIX = 'kcp-mobile:task-snapshot:v1:';
+function key(workspaceId: string, userId: string, locationId: string) { return `${PREFIX}${workspaceId}:${userId}:${locationId || 'all'}`; }
+export const taskSnapshotStore = {
+  get(workspaceId: string, userId: string, locationId: string): ActionsResponse | null { try { const raw = localStorage.getItem(key(workspaceId, userId, locationId)); if (!raw) return null; const saved = JSON.parse(raw); const actions = (saved.actions || saved.tasks || []).map((item: unknown) => normalizeAction(item, workspaceId)); const counts = Object.fromEntries(ACTION_STATUSES.map((status) => [status, actions.filter((action: { status: string }) => action.status === status).length])) as ActionsResponse['counts']; return { ok: true, generatedAt: saved.generatedAt || new Date(0).toISOString(), locationId, counts, actions }; } catch { return null; } },
+  set(workspaceId: string, userId: string, locationId: string, value: ActionsResponse) { try { const safe = { ...value, actions: value.actions.map((action) => ({ ...action, evidence: action.evidence.map(({ id, stepId, fileName, mimeType, byteSize, createdAt, createdByName }) => ({ id, stepId, fileName, mimeType, byteSize, createdAt, createdByName })) })) }; localStorage.setItem(key(workspaceId, userId, locationId), JSON.stringify(safe)); } catch { /* optional read-only snapshot */ } }
+};

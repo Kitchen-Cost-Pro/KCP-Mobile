@@ -1,0 +1,56 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { __test } from '../src/legacy/mobile-manufacturing';
+
+const { normalizeRawRecipe, computeProductionQuantities, aggregateRecipeRequirements, aggregateComponentPreviews, validatedRunEntries } = __test;
+
+test('normalizes legacy and current blueprint ingredient shapes', () => {
+  assert.deepEqual(normalizeRawRecipe([
+    { ingId: 'tomatoes', qty: 6, unit: 'kg' },
+    { stockItemId: 'salt', quantity: 0.2, uom: 'kg' },
+    { stock_item_id: '', quantity: 10 }
+  ]), [
+    { stockItemId: 'tomatoes', quantity: 6, unit: 'kg' },
+    { stockItemId: 'salt', quantity: 0.2, unit: 'kg' }
+  ]);
+});
+
+test('derives expected yield, variance and yield loss on the server', () => {
+  assert.deepEqual(computeProductionQuantities(10, 2, 19), {
+    expectedQuantity: 20,
+    yieldVariance: -1,
+    wastageQuantity: 1
+  });
+  assert.deepEqual(computeProductionQuantities(10, 2, 21), {
+    expectedQuantity: 20,
+    yieldVariance: 1,
+    wastageQuantity: 0
+  });
+});
+
+test('aggregates duplicate blueprint lines before checking stock availability', () => {
+  const required = aggregateRecipeRequirements([
+    { stockItemId: 'tomatoes', quantity: 5 },
+    { stockItemId: 'tomatoes', quantity: 1 },
+    { stockItemId: 'salt', quantity: 0.1 }
+  ], 2);
+  assert.equal(required.get('tomatoes'), 12);
+  assert.equal(required.get('salt'), 0.2);
+});
+
+test('aggregates shared components across a multi-product production run', () => {
+  const components = aggregateComponentPreviews([
+    { components: [{ stockItemId: 'flour', name: 'Flour', unit: 'kg', requiredQuantity: 6, onHand: 10 }] },
+    { components: [{ stockItemId: 'flour', name: 'Flour', unit: 'kg', requiredQuantity: 5, onHand: 10 }] }
+  ]);
+  assert.equal(components[0].requiredQuantity, 11);
+  assert.equal(components[0].remainingQuantity, -1);
+  assert.equal(components[0].available, false);
+});
+
+test('rejects duplicate products in a production run', () => {
+  assert.throws(() => validatedRunEntries({ entries: [
+    { manufacturedItemId: 'sauce', batchCount: 1, actualQuantity: 10 },
+    { manufacturedItemId: 'sauce', batchCount: 2, actualQuantity: 19 }
+  ] }), /only once/);
+});

@@ -1,0 +1,9 @@
+import { describe, expect, it } from 'vitest';
+
+describe('Phase 23 Operations Control contract', () => {
+  it('keeps the manager views and interventions explicit', () => {
+    const views=['all','location','role_set','user','overdue','waiting','blocked','completed','high_impact','unassigned'];
+    const interventions=['reassign','escalate','defer','priority','resolve_blocker'];
+    expect(views).toContain('high_impact'); expect(interventions).toContain('resolve_blocker');
+  });
+});

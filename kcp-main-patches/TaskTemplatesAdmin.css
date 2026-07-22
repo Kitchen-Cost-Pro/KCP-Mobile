@@ -1,0 +1,11 @@
+.task-template-admin { display: grid; gap: 1rem; }
+.task-template-admin > header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.task-template-admin h1,.task-template-admin h2,.task-template-admin p { margin: 0; }
+.task-template-layout { display: grid; grid-template-columns: minmax(220px,.7fr) minmax(0,1.5fr); gap: 1rem; }
+.task-template-layout aside,.task-template-layout main { display: grid; align-content: start; gap: .8rem; border: 1px solid var(--border-color,#d8dee6); border-radius: 12px; padding: 1rem; }
+.task-template-layout aside button { display: grid; gap: .25rem; padding: .75rem; text-align: left; }
+.task-template-layout main > div { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: .75rem; }
+.task-template-layout label { display: grid; gap: .35rem; }
+.task-template-layout input:not([type=checkbox]),.task-template-layout textarea,.task-template-layout select { width: 100%; box-sizing: border-box; }
+.task-template-actions { display: flex !important; justify-content: flex-end; grid-template-columns: none !important; }
+@media (max-width:800px){.task-template-layout{grid-template-columns:1fr}.task-template-layout main>div{grid-template-columns:1fr}}
