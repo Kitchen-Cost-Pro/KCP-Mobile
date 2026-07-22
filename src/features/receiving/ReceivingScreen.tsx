@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft, CalendarDays, Camera, Check, CheckCircle2, ChevronRight, ClipboardList, CloudOff,
-  FileText, LoaderCircle, PackageCheck, ReceiptText, RefreshCw, ScanBarcode, Search,
-  ShieldCheck, TriangleAlert, Undo2
+  FileText, LoaderCircle, PackageCheck, Plus, ReceiptText, RefreshCw, ScanBarcode, Search,
+  ShieldCheck, TriangleAlert, Undo2, X
 } from 'lucide-react';
 import { ApiError } from '../../core/api/client';
 import { createId } from '../../core/id/createId';
@@ -15,12 +15,16 @@ import {
   type ReceivingPreview, type ReceivingResult
 } from './receivingApi';
 import { receivingRecoveryStore } from './receivingRecoveryStore';
+import { canSeeOperationalValues, type FinancialVisibility } from '../role-sets/roleSetModel';
 
 type View = 'dashboard' | 'entry' | 'review' | 'complete';
-type Props = { workspaceId: string; userId: string; initialOrderId?: string; onActionEvent?: (event: 'waiting' | 'complete' | 'reject', detail?: string) => Promise<void> };
+type Props = { workspaceId: string; userId: string; initialOrderId?: string; financialVisibility?: FinancialVisibility; onActionEvent?: (event: 'waiting' | 'complete' | 'reject', detail?: string) => Promise<void> };
 
-export function ReceivingScreen({ workspaceId, userId, initialOrderId = '', onActionEvent }: Props) {
+const MAX_GRV_PHOTOS = 6;
+
+export function ReceivingScreen({ workspaceId, userId, initialOrderId = '', financialVisibility = 'full', onActionEvent }: Props) {
   const connected = useConnectivity();
+  const showMoney = canSeeOperationalValues(financialVisibility);
   const [view, setView] = useState<View>('dashboard');
   const [bootstrap, setBootstrap] = useState<ReceivingBootstrap | null>(null);
   const [order, setOrder] = useState<ReceivingOrder | null>(null);
@@ -62,7 +66,7 @@ export function ReceivingScreen({ workspaceId, userId, initialOrderId = '', onAc
     void receivingRecoveryStore.get(workspaceId, userId).then((recovery) => {
       if (!active) return;
       if (recovery) {
-        setDraft(recovery.draft); setOrder(recovery.order);
+        setDraft({ ...recovery.draft, evidence: normalizeEvidence(recovery.draft.evidence) }); setOrder(recovery.order);
         setNotice('Your unfinished goods receipt is ready to continue.');
       }
       setRecoveryLoaded(true);
@@ -154,7 +158,7 @@ export function ReceivingScreen({ workspaceId, userId, initialOrderId = '', onAc
     if (!order) return;
     if (!draft.invoiceNumber.trim()) { setError('Enter the supplier invoice number.'); return; }
     if (!selectedEntries.length) { setError('Enter a received quantity for at least one item.'); return; }
-    if (!draft.evidence) { setError('Take or attach a delivery photo before reviewing this GRV.'); return; }
+    if (!draft.evidence.length) { setError('Take or attach at least one delivery photo before reviewing this GRV.'); return; }
     if (!connected) { setError('Connect to KCP to validate this goods receipt.'); return; }
     setBusy(true); setError('');
     try {
@@ -166,13 +170,18 @@ export function ReceivingScreen({ workspaceId, userId, initialOrderId = '', onAc
 
   async function addPhoto(file?: File) {
     if (!file) return;
+    if (draft.evidence.length >= MAX_GRV_PHOTOS) { setError(`You can attach up to ${MAX_GRV_PHOTOS} delivery photos.`); return; }
     if (!/^image\/(jpeg|png|webp)$/.test(file.type)) { setError('Use a JPEG, PNG or WebP delivery photo.'); return; }
-    if (file.size > 1_000_000) { setError('The delivery photo must be 1 MB or smaller.'); return; }
+    if (file.size > 1_000_000) { setError('Each delivery photo must be 1 MB or smaller.'); return; }
     try {
-      const evidence: ReceivingEvidence = { clientId: createId('grv-photo'), fileName: file.name.slice(0, 120) || 'delivery-photo.jpg', mimeType: file.type, dataUrl: await readPhoto(file) };
-      setDraft((current) => ({ ...current, evidence }));
+      const photo: ReceivingEvidence = { clientId: createId('grv-photo'), fileName: file.name.slice(0, 120) || 'delivery-photo.jpg', mimeType: file.type, dataUrl: await readPhoto(file) };
+      setDraft((current) => ({ ...current, evidence: [...current.evidence, photo] }));
       setError(''); setNotice('Delivery photo attached as GRV evidence.');
     } catch { setError('The delivery photo could not be read. Try taking it again.'); }
+  }
+
+  function removePhoto(clientId: string) {
+    setDraft((current) => ({ ...current, evidence: current.evidence.filter((photo) => photo.clientId !== clientId) }));
   }
 
   async function commit() {
@@ -193,14 +202,14 @@ export function ReceivingScreen({ workspaceId, userId, initialOrderId = '', onAc
     void refresh(); window.scrollTo({ top: 0, behavior: 'instant' });
   }
 
-  if (view === 'complete' && result) return <ReceivingComplete result={result} onDone={finish} />;
-  if (view === 'review' && preview) return <ReceivingReview preview={preview} connected={connected} busy={busy} confirmed={confirmed} error={error} onConfirmed={setConfirmed} onBack={() => setView('entry')} onRefresh={review} onSubmit={commit} />;
+  if (view === 'complete' && result) return <ReceivingComplete result={result} showMoney={showMoney} onDone={finish} />;
+  if (view === 'review' && preview) return <ReceivingReview preview={preview} connected={connected} busy={busy} confirmed={confirmed} error={error} showMoney={showMoney} photoCount={draft.evidence.length} onConfirmed={setConfirmed} onBack={() => setView('entry')} onRefresh={review} onSubmit={commit} />;
   if (view === 'entry' && order) return <ReceivingEntryView
     order={order} draft={draft} lineBucket={lineBucket} filter={filter} barcode={barcode} highlightedLine={highlightedLine}
     enteredCount={enteredCount} connected={connected} busy={busy} error={error} notice={notice}
     onBack={() => setView('dashboard')} onDraft={setDraft} onBucket={setLineBucket} onFilter={setFilter} onBarcode={setBarcode}
     onResolveBarcode={resolveBarcode} onScan={scan} onUpdate={updateEntry} onCompleteLine={completeLine} onReturnLine={returnLine}
-    onReceiveAll={receiveAll} onPhoto={addPhoto} onReview={review}
+    onReceiveAll={receiveAll} onPhoto={addPhoto} onRemovePhoto={removePhoto} onReview={review}
   />;
 
   const orders = (bootstrap?.orders || []).filter((entry) => entry.statusBucket === orderBucket);
@@ -224,7 +233,7 @@ type EntryViewProps = {
   onBack: () => void; onDraft: React.Dispatch<React.SetStateAction<ReceivingDraft>>; onBucket: (value: 'todo' | 'entered') => void;
   onFilter: (value: string) => void; onBarcode: (value: string) => void; onResolveBarcode: (value: string) => void; onScan: () => void;
   onUpdate: (line: ReceivingOrderLine, field: 'receivedQuantity' | 'note', value: string) => void;
-  onCompleteLine: (line: ReceivingOrderLine) => void; onReturnLine: (line: ReceivingOrderLine) => void; onReceiveAll: () => void; onPhoto: (file?: File) => void; onReview: () => void;
+  onCompleteLine: (line: ReceivingOrderLine) => void; onReturnLine: (line: ReceivingOrderLine) => void; onReceiveAll: () => void; onPhoto: (file?: File) => void; onRemovePhoto: (clientId: string) => void; onReview: () => void;
 };
 
 function ReceivingEntryView(props: EntryViewProps) {
@@ -244,19 +253,22 @@ function ReceivingEntryView(props: EntryViewProps) {
       <label><span>Receipt note</span><input value={props.draft.note} maxLength={500} onChange={(event) => props.onDraft((current) => ({ ...current, note: event.target.value }))} placeholder="Optional note" /></label>
     </div></section>
     <section className="operation-section receiving-scan-section"><div className="section-title"><div><p className="eyebrow">Find on this PO</p><h2>Scan a delivered item</h2></div><ScanBarcode size={20} /></div><button className="scan-action receiving-scan" type="button" onClick={props.onScan} disabled={!props.connected || props.busy}><ScanBarcode size={22} /><span><strong>Open barcode scanner</strong><small>Only items on {props.order.poNumber} can match</small></span><ChevronRight size={18} /></button><div className="manual-barcode"><input value={props.barcode} onChange={(event) => props.onBarcode(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') props.onResolveBarcode(props.barcode); }} placeholder="Enter barcode manually" /><button type="button" onClick={() => props.onResolveBarcode(props.barcode)} disabled={!props.connected || props.busy}>Check</button></div></section>
-    <section className="operation-section receiving-lines-section"><div className="section-title"><div><p className="eyebrow">Step 2 · GRV lines</p><h2>{props.enteredCount} of {props.order.lines.length} checked</h2></div><button className="text-button" type="button" onClick={props.onReceiveAll}>Everything matches</button></div><div className="receiving-progress"><div><strong>{props.enteredCount}</strong><span>checked</span></div><progress max={Math.max(props.order.lines.length, 1)} value={props.enteredCount} /></div><div className="search-field receiving-list-filter"><Search size={17} /><input value={props.filter} onChange={(event) => props.onFilter(event.target.value)} placeholder="Filter this purchase order" /></div><div className="segmented-tabs receiving-line-tabs"><button className={props.lineBucket === 'todo' ? 'is-active' : ''} type="button" onClick={() => props.onBucket('todo')}>To check <span>{props.order.lines.length - props.enteredCount}</span></button><button className={props.lineBucket === 'entered' ? 'is-active' : ''} type="button" onClick={() => props.onBucket('entered')}>Checked <span>{props.enteredCount}</span></button></div><div className="receiving-line-list">{visible.length ? visible.map((line) => {
+    <section className="operation-section receiving-lines-section"><div className="section-title"><div><p className="eyebrow">Step 2 · GRV lines</p><h2>{props.enteredCount} of {props.order.lines.length} checked</h2></div><button className="text-button" type="button" onClick={props.onReceiveAll}>Everything matches</button></div><div className="receiving-progress"><div><strong>{props.enteredCount}</strong><span>checked</span></div><progress max={Math.max(props.order.lines.length, 1)} value={props.enteredCount} /></div>{props.enteredCount < props.order.lines.length && <button className="button button-secondary receiving-confirm-all" type="button" onClick={props.onReceiveAll}><Check size={17} /> Everything arrived as ordered</button>}<div className="search-field receiving-list-filter"><Search size={17} /><input value={props.filter} onChange={(event) => props.onFilter(event.target.value)} placeholder="Filter this purchase order" /></div><div className="segmented-tabs receiving-line-tabs"><button className={props.lineBucket === 'todo' ? 'is-active' : ''} type="button" onClick={() => props.onBucket('todo')}>To check <span>{props.order.lines.length - props.enteredCount}</span></button><button className={props.lineBucket === 'entered' ? 'is-active' : ''} type="button" onClick={() => props.onBucket('entered')}>Checked <span>{props.enteredCount}</span></button></div><div className="receiving-line-list">{visible.length ? visible.map((line) => {
         const entry = props.draft.entries[line.id] || { receivedQuantity: '', note: '', entered: false };
         const match = lineMatch(line.outstandingQuantity, Number(entry.receivedQuantity));
         return <article id={`receiving-line-${line.id}`} key={line.id} className={`${entry.entered ? 'is-entered' : ''} ${props.highlightedLine === line.id ? 'is-highlighted' : ''}`}><header><span className="receiving-line-icon"><PackageCheck size={18} /></span><div><strong>{line.name}</strong><small>{line.sku || line.category || 'KCP stock item'}</small></div><b>{formatQuantity(line.outstandingQuantity)} {line.receivingUom} expected</b></header><div className="receiving-line-stats"><span>Ordered <strong>{formatQuantity(line.orderedQuantity)}</strong></span><span>Already received <strong>{formatQuantity(line.previouslyReceivedQuantity)}</strong></span><span>Pack size <strong>{formatQuantity(line.packSize)}</strong></span></div><div className="receiving-line-fields"><label><span>Received now</span><div><input aria-label={`${line.name} received now`} type="number" inputMode="decimal" min="0" step="any" value={entry.receivedQuantity} onChange={(event) => props.onUpdate(line, 'receivedQuantity', event.target.value)} /><small>{line.receivingUom}</small></div></label><label><span>Line note</span><input aria-label={`${line.name} line note`} value={entry.note} maxLength={160} onChange={(event) => props.onUpdate(line, 'note', event.target.value)} placeholder={match.status === 'match' ? 'Optional' : 'Explain discrepancy'} /></label></div>{Number(entry.receivedQuantity) > 0 && <div className={`receiving-match is-${match.status}`}><strong>{match.label}</strong><span>{match.detail}</span></div>}{entry.entered ? <button className="receiving-return" type="button" onClick={() => props.onReturnLine(line)}><Undo2 size={15} /> Edit line</button> : <button className="receiving-done" type="button" onClick={() => props.onCompleteLine(line)}><Check size={15} /> Check line</button>}</article>;
       }) : <div className="transfer-empty">No items match this view.</div>}</div></section>
-    <section className="operation-section receiving-evidence"><div className="section-title"><div><p className="eyebrow">Step 3 · Evidence</p><h2>Delivery photo</h2></div><Camera size={20} /></div><label className={`receiving-photo ${props.draft.evidence ? 'has-photo' : ''}`}><Camera size={20} /><span><strong>{props.draft.evidence ? 'Photo attached' : 'Take delivery photo *'}</strong><small>{props.draft.evidence?.fileName || 'Invoice, delivery note or delivered goods'}</small></span><input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" disabled={!props.connected} onChange={(event) => { props.onPhoto(event.target.files?.[0]); event.currentTarget.value = ''; }} /></label><p>The photo is stored with the GRV as receiving evidence.</p></section>
-    <button className="button button-primary button-large operation-submit" type="button" onClick={props.onReview} disabled={!props.connected || props.busy || !props.enteredCount || !props.draft.evidence}>{props.busy ? <LoaderCircle className="spin" size={18} /> : <ClipboardList size={18} />} Compare and review GRV</button>
+    <section className="operation-section receiving-evidence"><div className="section-title"><div><p className="eyebrow">Step 3 · Evidence</p><h2>Delivery photos</h2></div><Camera size={20} /></div>
+      {props.draft.evidence.length > 0 && <div className="receiving-photo-grid">{props.draft.evidence.map((photo) => <figure key={photo.clientId} className="receiving-photo-thumb"><img src={photo.dataUrl} alt={photo.fileName} /><button type="button" aria-label={`Remove ${photo.fileName}`} onClick={() => props.onRemovePhoto(photo.clientId)}><X size={14} /></button></figure>)}</div>}
+      <label className={`receiving-photo ${props.draft.evidence.length ? 'has-photo' : ''}`}>{props.draft.evidence.length ? <Plus size={20} /> : <Camera size={20} />}<span><strong>{props.draft.evidence.length ? 'Photo attached' : 'Take delivery photo *'}</strong><small>{props.draft.evidence.length ? `${props.draft.evidence.length} of ${MAX_GRV_PHOTOS} attached · add another` : 'Invoice, delivery note or delivered goods'}</small></span><input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" disabled={!props.connected || props.draft.evidence.length >= MAX_GRV_PHOTOS} onChange={(event) => { props.onPhoto(event.target.files?.[0]); event.currentTarget.value = ''; }} /></label>
+      <p>Photos are stored with the GRV as receiving evidence for later review and AI receipt scanning.</p></section>
+    <button className="button button-primary button-large operation-submit" type="button" onClick={props.onReview} disabled={!props.connected || props.busy || !props.enteredCount || !props.draft.evidence.length}>{props.busy ? <LoaderCircle className="spin" size={18} /> : <ClipboardList size={18} />} Compare and review GRV</button>
   </div>;
 }
 
-function ReceivingReview(props: { preview: ReceivingPreview; connected: boolean; busy: boolean; confirmed: boolean; error: string; onConfirmed: (value: boolean) => void; onBack: () => void; onRefresh: () => void; onSubmit: () => void }) {
+function ReceivingReview(props: { preview: ReceivingPreview; connected: boolean; busy: boolean; confirmed: boolean; error: string; showMoney: boolean; photoCount: number; onConfirmed: (value: boolean) => void; onBack: () => void; onRefresh: () => void; onSubmit: () => void }) {
   return <div className="screen review-screen receiving-review"><header className="count-header"><button className="icon-button" type="button" onClick={props.onBack} aria-label="Back to receiving entry"><ArrowLeft size={19} /></button><div><p className="eyebrow">Server preview</p><h1>Confirm delivery</h1></div><span /></header>{props.error && <div className="message message-error operation-message" role="alert">{props.error}</div>}
-    <section className="operation-section receiving-review-summary"><div className="section-title"><div><p className="eyebrow">{props.preview.order.poNumber}</p><h2>{props.preview.order.supplierName}</h2></div><ReceiptText size={20} /></div><div className="receiving-review-meta"><span>Invoice <strong>{props.preview.invoiceNumber}</strong></span><span>Location <strong>{props.preview.order.location.name}</strong></span><span>Received <strong>{formatDate(props.preview.receivedAt)}</strong></span><span>Evidence <strong>1 photo</strong></span></div><div className="receiving-review-lines">{props.preview.entries.map((entry) => <article key={entry.id} className={`is-${entry.matchStatus}`}><div><strong>{entry.name}</strong><small>Expected {formatQuantity(entry.outstandingQuantity)} · received {formatQuantity(entry.receivedQuantity)} {entry.receivingUom}</small></div><span className={`review-match is-${entry.matchStatus}`}>{matchLabel(entry.matchStatus)}</span></article>)}</div><div className="receiving-totals"><span>Matching lines <strong>{props.preview.entries.filter((entry) => entry.matchStatus === 'match').length} / {props.preview.entries.length}</strong></span><span>PO after posting <strong>{humanStatus(props.preview.completionStatus)}</strong></span><span>Total <strong>{formatMoney(props.preview.totalInc)}</strong></span></div></section>
+    <section className="operation-section receiving-review-summary"><div className="section-title"><div><p className="eyebrow">{props.preview.order.poNumber}</p><h2>{props.preview.order.supplierName}</h2></div><ReceiptText size={20} /></div><div className="receiving-review-meta"><span>Invoice <strong>{props.preview.invoiceNumber}</strong></span><span>Location <strong>{props.preview.order.location.name}</strong></span><span>Received <strong>{formatDate(props.preview.receivedAt)}</strong></span><span>Evidence <strong>{props.photoCount} photo{props.photoCount === 1 ? '' : 's'}</strong></span></div><div className="receiving-review-lines">{props.preview.entries.map((entry) => <article key={entry.id} className={`is-${entry.matchStatus}`}><div><strong>{entry.name}</strong><small>Expected {formatQuantity(entry.outstandingQuantity)} · received {formatQuantity(entry.receivedQuantity)} {entry.receivingUom}</small></div><span className={`review-match is-${entry.matchStatus}`}>{matchLabel(entry.matchStatus)}</span></article>)}</div><div className="receiving-totals"><span>Matching lines <strong>{props.preview.entries.filter((entry) => entry.matchStatus === 'match').length} / {props.preview.entries.length}</strong></span><span>PO after posting <strong>{humanStatus(props.preview.completionStatus)}</strong></span>{props.showMoney && <span>Total <strong>{formatMoney(props.preview.totalInc)}</strong></span>}</div></section>
     {props.preview.blockingErrors.map((entry) => <div className="message message-error operation-message" key={entry}><TriangleAlert size={17} /> {entry}</div>)}{props.preview.warnings.map((entry) => <div className="message message-warning operation-message" key={entry}><TriangleAlert size={17} /> {entry}</div>)}
     <div className="server-authority-note"><ShieldCheck size={20} /><div><strong>KCP validates again when posting</strong><p>The PO state, outstanding quantities, supplier invoice and your location access are checked atomically.</p></div></div>
     <button className="button button-secondary button-large operation-submit" type="button" disabled={!props.connected || props.busy} onClick={props.onRefresh}><RefreshCw size={18} /> Refresh preview</button>
@@ -265,8 +277,8 @@ function ReceivingReview(props: { preview: ReceivingPreview; connected: boolean;
   </div>;
 }
 
-function ReceivingComplete({ result, onDone }: { result: ReceivingResult; onDone: () => void }) {
-  return <div className="screen complete-screen"><section className="complete-card receiving-complete-card"><span className="complete-icon"><CheckCircle2 size={35} /></span><p className="eyebrow">{result.duplicate ? 'Already posted safely' : 'Goods receipt posted'}</p><h1>Delivery received</h1><p>{result.lineCount} purchase-order line{result.lineCount === 1 ? '' : 's'} updated at {result.locationName}.</p><div className="transaction-reference"><span>GRV reference</span><strong>{result.transactionReference || result.receiptId}</strong></div><div className="receiving-complete-meta"><span>PO <strong>{result.poNumber}</strong></span><span>Invoice <strong>{result.invoiceNumber}</strong></span><span>Status <strong>{humanStatus(result.status)}</strong></span><span>Total <strong>{formatMoney(result.totalInc)}</strong></span></div><button className="button button-primary button-large" type="button" onClick={onDone}>Back to goods receiving</button></section></div>;
+function ReceivingComplete({ result, showMoney, onDone }: { result: ReceivingResult; showMoney: boolean; onDone: () => void }) {
+  return <div className="screen complete-screen"><section className="complete-card receiving-complete-card"><span className="complete-icon"><CheckCircle2 size={35} /></span><p className="eyebrow">{result.duplicate ? 'Already posted safely' : 'Goods receipt posted'}</p><h1>Delivery received</h1><p>{result.lineCount} purchase-order line{result.lineCount === 1 ? '' : 's'} updated at {result.locationName}.</p><div className="transaction-reference"><span>GRV reference</span><strong>{result.transactionReference || result.receiptId}</strong></div><div className="receiving-complete-meta"><span>PO <strong>{result.poNumber}</strong></span><span>Invoice <strong>{result.invoiceNumber}</strong></span><span>Status <strong>{humanStatus(result.status)}</strong></span>{showMoney && <span>Total <strong>{formatMoney(result.totalInc)}</strong></span>}</div><button className="button button-primary button-large" type="button" onClick={onDone}>Back to goods receiving</button></section></div>;
 }
 
 function RecentReceipts({ bootstrap }: { bootstrap: ReceivingBootstrap | null }) {
@@ -275,11 +287,18 @@ function RecentReceipts({ bootstrap }: { bootstrap: ReceivingBootstrap | null })
 }
 
 function emptyDraft(purchaseOrderId = ''): ReceivingDraft {
-  return { clientReceiptId: createId('grv'), purchaseOrderId, invoiceNumber: '', deliveryNote: '', receivedAt: today(), note: '', evidence: null, entries: {} };
+  return { clientReceiptId: createId('grv'), purchaseOrderId, invoiceNumber: '', deliveryNote: '', receivedAt: today(), note: '', evidence: [], entries: {} };
+}
+// Recovered drafts (and drafts saved before multi-photo) may store evidence as a
+// single object, null, or be missing it entirely. Coerce to an array so the rest
+// of the screen can treat it uniformly.
+function normalizeEvidence(value: unknown): ReceivingEvidence[] {
+  if (Array.isArray(value)) return value as ReceivingEvidence[];
+  return value && typeof value === 'object' ? [value as ReceivingEvidence] : [];
 }
 function today() { const now = new Date(); return new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 10); }
 function toEntries(draft: ReceivingDraft): ReceivingEntry[] { return Object.entries(draft.entries).filter(([, entry]) => entry.entered && Number(entry.receivedQuantity) > 0).map(([lineId, entry]) => ({ lineId, receivedQuantity: Number(entry.receivedQuantity), note: entry.note.trim() })); }
-function payload(draft: ReceivingDraft) { return { purchaseOrderId: draft.purchaseOrderId, invoiceNumber: draft.invoiceNumber.trim(), deliveryNote: draft.deliveryNote.trim(), receivedAt: draft.receivedAt, note: draft.note.trim(), evidence: draft.evidence, entries: toEntries(draft) }; }
+function payload(draft: ReceivingDraft) { const photos = normalizeEvidence(draft.evidence); return { purchaseOrderId: draft.purchaseOrderId, invoiceNumber: draft.invoiceNumber.trim(), deliveryNote: draft.deliveryNote.trim(), receivedAt: draft.receivedAt, note: draft.note.trim(), evidence: photos[0] || null, evidencePhotos: photos, entries: toEntries(draft) }; }
 function formatQuantity(value: number) { return new Intl.NumberFormat('en-ZA', { maximumFractionDigits: 3 }).format(Number(value || 0)); }
 function formatMoney(value: number) { return new Intl.NumberFormat('en-ZA', { style: 'currency', currency: 'ZAR' }).format(Number(value || 0)); }
 function formatDate(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? 'Date unavailable' : new Intl.DateTimeFormat('en-ZA', { dateStyle: 'medium' }).format(date); }

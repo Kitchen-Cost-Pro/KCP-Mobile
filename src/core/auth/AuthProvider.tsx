@@ -28,6 +28,7 @@ import {
 } from './workspaces';
 import { loadWorkspaceBootstrap } from '../api/workspaceApi';
 import { applyWorkspaceTheme, THEME_PRESETS } from '../theme/presets';
+import { clearReadSnapshots } from '../offline/snapshotCache';
 
 const defaultTheme = THEME_PRESETS['kcp-classic'];
 
@@ -194,6 +195,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch {
       await sessionStore.clear();
     }
+    await clearReadSnapshots();
     if (userId) clearLastWorkspace(userId);
     applyWorkspaceTheme(defaultTheme);
     patchState({ ...initialState, resetToken: '', stage: 'signed-out', busy: false });
@@ -262,7 +264,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     requestReset,
     confirmReset,
     completeForcedPassword,
-    selectWorkspace: (workspace) => selectWorkspaceInternal(workspace),
+    selectWorkspace: async (workspace) => { await clearReadSnapshots(); return selectWorkspaceInternal(workspace); },
     showWorkspacePicker: () => patchState({ stage: 'workspace-select', workspaceBootstrap: null, error: '' }),
     showLogin: () => patchState({ stage: 'signed-out', error: '', notice: '' }),
     showResetRequest: () => patchState({ stage: 'reset-request', error: '', notice: '' }),

@@ -14,12 +14,16 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  ScanBarcode,
   Search,
   ShieldCheck,
   TriangleAlert
 } from 'lucide-react';
 import { ApiError } from '../../core/api/client';
 import { useConnectivity } from '../../hooks/useConnectivity';
+import { scanBarcodeWithDevice } from '../wastage/nativeBarcodeScanner';
+import { normalizeKcpBarcode } from '../../core/barcodes/normalizeBarcode';
+import { canSeeOperationalValues, type FinancialVisibility } from '../role-sets/roleSetModel';
 import type {
   KcpLocation,
   StockCountDraft,
@@ -63,13 +67,16 @@ type Props = {
   location: KcpLocation | null;
   onLocation: () => void;
   initialSourceId?: string;
+  financialVisibility?: FinancialVisibility;
   onActionEvent?: (event: 'waiting' | 'complete' | 'reject', detail?: string) => Promise<void>;
 };
 
 const PAGE_SIZE = 50;
 
-export function StockTakeScreen({ workspaceId, userId, location, onLocation, initialSourceId = '', onActionEvent }: Props) {
+export function StockTakeScreen({ workspaceId, userId, location, onLocation, initialSourceId = '', financialVisibility = 'full', onActionEvent }: Props) {
   const connected = useConnectivity();
+  const showMoney = canSeeOperationalValues(financialVisibility);
+  const [barcode, setBarcode] = useState('');
   const [view, setView] = useState<View>('overview');
   const [templates, setTemplates] = useState<StockCountTemplate[]>([]);
   const [drafts, setDrafts] = useState<StockCountDraft[]>([]);
@@ -434,6 +441,41 @@ export function StockTakeScreen({ workspaceId, userId, location, onLocation, ini
     });
   }, [active, countBucket, editingItemId, filteredItems]);
 
+  // Scan-to-count: match a scanned/typed barcode against the loaded count items
+  // locally (so it works offline), then surface that item's card ready for entry.
+  // A barcode registered against a custom UOM points the counter at that unit.
+  const resolveCountBarcode = useCallback((raw: string) => {
+    const current = activeRef.current;
+    if (!current) return;
+    const code = normalizeKcpBarcode(raw);
+    if (!code) { setError('Scan or enter a barcode first.'); return; }
+    let matchedUom = '';
+    const match = current.items.find((candidate) => {
+      if (candidate.barcodes.some((value) => normalizeKcpBarcode(value) === code)) return true;
+      const uom = candidate.uoms.find((entry) => entry.barcode && normalizeKcpBarcode(entry.barcode) === code);
+      if (uom) { matchedUom = uom.name; return true; }
+      return false;
+    });
+    if (!match) { setError('That barcode is not on this stock take.'); return; }
+    setError('');
+    setBarcode('');
+    setSearch(match.name);
+    setVisibleLimit(PAGE_SIZE);
+    setCountBucket('pending');
+    setEditingItemId(match.id);
+    setNotice(`${match.name} ready · enter ${matchedUom || match.baseUom}`);
+    window.setTimeout(() => {
+      const card = document.getElementById(`count-card-${match.id}`);
+      if (typeof card?.scrollIntoView === 'function') card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      card?.querySelector<HTMLInputElement>('input[type="number"]')?.focus();
+    }, 60);
+  }, []);
+
+  const scanToCount = useCallback(async () => {
+    try { const value = await scanBarcodeWithDevice(); setBarcode(value); resolveCountBarcode(value); }
+    catch (cause) { setError(message(cause, 'Barcode scan was cancelled.')); }
+  }, [resolveCountBarcode]);
+
   if (view === 'count' && active) {
     return (
       <CountEntryView
@@ -449,6 +491,10 @@ export function StockTakeScreen({ workspaceId, userId, location, onLocation, ini
         error={error}
         notice={notice}
         search={search}
+        barcode={barcode}
+        onScan={() => { void scanToCount(); }}
+        onBarcode={setBarcode}
+        onResolveBarcode={resolveCountBarcode}
         onSearch={(value) => { setSearch(value); setVisibleLimit(PAGE_SIZE); }}
         onBucket={(value) => { setCountBucket(value); setEditingItemId(''); setVisibleLimit(PAGE_SIZE); }}
         onBack={() => { void backToOverview(); }}
@@ -471,6 +517,7 @@ export function StockTakeScreen({ workspaceId, userId, location, onLocation, ini
         connected={connected}
         busy={busy}
         error={error}
+        showMoney={showMoney}
         onConfirmed={setConfirmed}
         onBack={() => { setError(''); setView('count'); }}
         onSubmit={() => { void submitCount(); }}
@@ -479,7 +526,7 @@ export function StockTakeScreen({ workspaceId, userId, location, onLocation, ini
   }
 
   if (view === 'complete' && active && commitResult) {
-    return <CompleteView active={active} result={commitResult} onDone={() => { void backToOverview(); }} />;
+    return <CompleteView active={active} result={commitResult} showMoney={showMoney} onDone={() => { void backToOverview(); }} />;
   }
 
   return (
@@ -576,6 +623,10 @@ type CountEntryProps = {
   error: string;
   notice: string;
   search: string;
+  barcode: string;
+  onScan: () => void;
+  onBarcode: (value: string) => void;
+  onResolveBarcode: (value: string) => void;
   onSearch: (value: string) => void;
   onBucket: (value: CountBucket) => void;
   onBack: () => void;
@@ -612,6 +663,11 @@ function CountEntryView(props: CountEntryProps) {
       </div>
 
       {props.error && <div className="message message-error stock-message" role="alert">{props.error}</div>}
+
+      <div className="count-scan-row">
+        <button className="count-scan" type="button" onClick={props.onScan} disabled={props.busy}><ScanBarcode size={20} /><span><strong>Scan an item</strong><small>Jump to its card and enter the quantity</small></span></button>
+        <div className="manual-barcode count-manual-barcode"><input aria-label="Barcode" value={props.barcode} onChange={(event) => props.onBarcode(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') props.onResolveBarcode(props.barcode); }} placeholder="Enter barcode" /><button type="button" onClick={() => props.onResolveBarcode(props.barcode)}>Find</button></div>
+      </div>
 
       <label className="count-search">
         <Search size={18} />
@@ -672,6 +728,7 @@ function CountItemCard({ item, line, position, bucket, onChange, onEditing, onFi
   }, 0);
   return (
     <article
+      id={`count-card-${item.id}`}
       className={`count-item-card ${line.counted ? 'is-counted' : ''}`}
       onFocusCapture={onEditing}
       onBlurCapture={(event) => {
@@ -754,13 +811,14 @@ function QuantityField({ label, hint, value, onValue }: { label: string; hint?: 
   );
 }
 
-function ReviewView({ active, reconciliation, confirmed, connected, busy, error, onConfirmed, onBack, onSubmit }: {
+function ReviewView({ active, reconciliation, confirmed, connected, busy, error, showMoney, onConfirmed, onBack, onSubmit }: {
   active: ActiveCount;
   reconciliation: StockCountReconciliation;
   confirmed: boolean;
   connected: boolean;
   busy: boolean;
   error: string;
+  showMoney: boolean;
   onConfirmed: (value: boolean) => void;
   onBack: () => void;
   onSubmit: () => void;
@@ -776,7 +834,7 @@ function ReviewView({ active, reconciliation, confirmed, connected, busy, error,
       <section className="review-summary">
         <div><span>Counted</span><strong>{reconciliation.countedItemCount}</strong></div>
         <div><span>Uncounted</span><strong>{reconciliation.uncountedItemCount}</strong></div>
-        <div className={reconciliation.netVarianceValue < 0 ? 'negative' : reconciliation.netVarianceValue > 0 ? 'positive' : ''}><span>Net variance</span><strong>{formatMoney(reconciliation.netVarianceValue, reconciliation.currency)}</strong></div>
+        {showMoney && <div className={reconciliation.netVarianceValue < 0 ? 'negative' : reconciliation.netVarianceValue > 0 ? 'positive' : ''}><span>Net variance</span><strong>{formatMoney(reconciliation.netVarianceValue, reconciliation.currency)}</strong></div>}
       </section>
 
       {blocked && <div className="blocking-panel"><TriangleAlert size={20} /><div><strong>Submission blocked</strong>{reconciliation.blockingErrors.map((entry) => <p key={entry}>{entry}</p>)}</div></div>}
@@ -788,7 +846,7 @@ function ReviewView({ active, reconciliation, confirmed, connected, busy, error,
           {reconciliation.lines.map((line) => (
             <article className="variance-card" key={line.stockItemId}>
               <div><strong>{line.name}</strong><p>{formatQuantity(line.countedBaseQuantity)} counted · {formatQuantity(line.expectedQuantity)} expected</p></div>
-              <span className={line.varianceValue < 0 ? 'negative' : line.varianceValue > 0 ? 'positive' : ''}>{formatMoney(line.varianceValue, reconciliation.currency)}</span>
+              {showMoney ? <span className={line.varianceValue < 0 ? 'negative' : line.varianceValue > 0 ? 'positive' : ''}>{formatMoney(line.varianceValue, reconciliation.currency)}</span> : <span className={line.varianceQuantity < 0 ? 'negative' : line.varianceQuantity > 0 ? 'positive' : ''}>{formatQuantity(line.varianceQuantity)}</span>}
             </article>
           ))}
         </div>
@@ -805,7 +863,7 @@ function ReviewView({ active, reconciliation, confirmed, connected, busy, error,
   );
 }
 
-function CompleteView({ active, result, onDone }: { active: ActiveCount; result: StockCountCommitResult; onDone: () => void }) {
+function CompleteView({ active, result, showMoney, onDone }: { active: ActiveCount; result: StockCountCommitResult; showMoney: boolean; onDone: () => void }) {
   return (
     <div className="screen complete-screen">
       <section className="complete-card">
@@ -814,7 +872,7 @@ function CompleteView({ active, result, onDone }: { active: ActiveCount; result:
         <h1>Stock take complete</h1>
         <p>{active.template.name} at {active.location.name} is now reflected in KCP.</p>
         <div className="transaction-reference"><span>Transaction reference</span><strong>{result.transactionId}</strong></div>
-        <div className="complete-stats"><div><strong>{result.countedItemCount}</strong><span>items</span></div><div><strong>{formatMoney(result.netVarianceValue, result.currency)}</strong><span>net variance</span></div></div>
+        <div className="complete-stats"><div><strong>{result.countedItemCount}</strong><span>items</span></div>{showMoney && <div><strong>{formatMoney(result.netVarianceValue, result.currency)}</strong><span>net variance</span></div>}</div>
         <button className="button button-primary button-large" type="button" onClick={onDone}>Return to stock takes</button>
       </section>
     </div>

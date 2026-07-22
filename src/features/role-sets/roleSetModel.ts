@@ -85,6 +85,14 @@ export function canSeeFinancialImpact(roleSet: RoleSet, amount?: number | null) 
   return roleSet.financialVisibility === 'material_only' && Number(amount || 0) >= Number(roleSet.escalation.financialThreshold || 0);
 }
 
+// Operational money on working screens (unit costs, order/GRV totals, wastage and
+// variance values). Owners/managers and operational leads (full / material_only)
+// see it; plain line roles (none) never do. Kept as a plain visibility check so a
+// screen only needs the financialVisibility value, not the whole role set.
+export function canSeeOperationalValues(financialVisibility: FinancialVisibility) {
+  return financialVisibility !== 'none';
+}
+
 function fallbackRoleSetId(role: string) {
   if (['owner', 'admin', 'superuser', 'super-user'].includes(role)) return 'owner-area-manager';
   if (['manager'].includes(role)) return 'kitchen-store-manager';
