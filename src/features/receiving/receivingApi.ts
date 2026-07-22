@@ -75,7 +75,7 @@ export type ReceivingDraft = {
   deliveryNote: string;
   receivedAt: string;
   note: string;
-  evidence: ReceivingEvidence | null;
+  evidence: ReceivingEvidence[];
   entries: Record<string, { receivedQuantity: string; note: string; entered: boolean }>;
 };
 
@@ -139,6 +139,10 @@ export function lookupReceivingBarcode(workspaceId: string, orderId: string, bar
   );
 }
 
+// `evidence` remains the primary (first) photo so the existing Worker contract is
+// unchanged. `evidencePhotos` is additive: it carries every attached photo so the
+// backend can retain the full set for later AI receipt/invoice scanning once the
+// Worker is updated to read it.
 export function previewReceiving(workspaceId: string, payload: {
   purchaseOrderId: string;
   invoiceNumber: string;
@@ -146,6 +150,7 @@ export function previewReceiving(workspaceId: string, payload: {
   receivedAt: string;
   note: string;
   evidence: ReceivingEvidence | null;
+  evidencePhotos?: ReceivingEvidence[];
   entries: ReceivingEntry[];
 }) {
   return apiRequest<ReceivingPreview>(mobilePath(workspaceId, 'receiving/preview'), { method: 'POST', payload });
@@ -159,6 +164,7 @@ export function commitReceiving(workspaceId: string, payload: {
   receivedAt: string;
   note: string;
   evidence: ReceivingEvidence | null;
+  evidencePhotos?: ReceivingEvidence[];
   entries: ReceivingEntry[];
   previewToken: string;
   confirm: true;

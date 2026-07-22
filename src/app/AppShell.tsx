@@ -202,17 +202,18 @@ export function AppShell() {
   const content = route === 'insights'
     ? <InsightsScreen workspaceId={auth.workspace!.id} connected={connected} location={selectedLocation} access={access} featureFlags={featureFlags} financialVisibility={roleSet.financialVisibility} onNavigate={navigate} onLocation={() => setLocationPickerOpen(true)} />
     : route === 'stock-takes'
-    ? <StockTakeScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} location={selectedLocation} onLocation={() => setLocationPickerOpen(true)} initialSourceId={activeFlowAction?.sourceRecord.id || ''} onActionEvent={resolveFlowAction} />
+    ? <StockTakeScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} location={selectedLocation} onLocation={() => setLocationPickerOpen(true)} initialSourceId={activeFlowAction?.sourceRecord.id || ''} financialVisibility={roleSet.financialVisibility} onActionEvent={resolveFlowAction} />
     : route === 'tasks'
       ? <KcpFlowScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} connected={connected} location={selectedLocation} roleSet={roleSet} onLocation={() => setLocationPickerOpen(true)} initialActionId={recordTarget?.route==='tasks'?recordTarget.recordId:''} />
     : route === 'approvals'
-      ? <ApprovalsScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} connected={connected} location={selectedLocation} onLocation={() => setLocationPickerOpen(true)} initialApprovalId={recordTarget?.route==='approvals'?recordTarget.recordId:''} onActionEvent={resolveFlowAction} />
+      ? <ApprovalsScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} connected={connected} location={selectedLocation} onLocation={() => setLocationPickerOpen(true)} initialApprovalId={recordTarget?.route==='approvals'?recordTarget.recordId:''} financialVisibility={roleSet.financialVisibility} onActionEvent={resolveFlowAction} />
     : route === 'wastage'
       ? <WastageScreen
           workspaceId={auth.workspace!.id}
           userId={auth.user!.uid}
           location={selectedLocation}
           canSearchItems={hasSectionAccess(access, 'stock-lookup')}
+          financialVisibility={roleSet.financialVisibility}
           onLocation={() => setLocationPickerOpen(true)}
           onActionEvent={resolveFlowAction}
         />
@@ -225,9 +226,9 @@ export function AppShell() {
     : route === 'manufacturing'
       ? <ManufacturingScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} location={selectedLocation} onLocation={() => setLocationPickerOpen(true)} initialSourceId={activeFlowAction?.sourceRecord.id || ''} onActionEvent={resolveFlowAction} />
     : route === 'receiving'
-      ? <ReceivingScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} initialOrderId={recordTarget?.route==='receiving'?recordTarget.recordId:''} onActionEvent={resolveFlowAction} />
+      ? <ReceivingScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} initialOrderId={recordTarget?.route==='receiving'?recordTarget.recordId:''} financialVisibility={roleSet.financialVisibility} onActionEvent={resolveFlowAction} />
     : route === 'purchase-orders'
-      ? <PurchaseOrdersScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} workspaceName={auth.workspace!.siteName} preload={purchaseOrderPreload} onPreloadConsumed={() => setPurchaseOrderPreload(null)} initialOrderId={recordTarget?.route==='purchase-orders'?recordTarget.recordId:''} onReceive={processPurchaseOrder} onActionEvent={resolveFlowAction} />
+      ? <PurchaseOrdersScreen workspaceId={auth.workspace!.id} userId={auth.user!.uid} workspaceName={auth.workspace!.siteName} preload={purchaseOrderPreload} onPreloadConsumed={() => setPurchaseOrderPreload(null)} initialOrderId={recordTarget?.route==='purchase-orders'?recordTarget.recordId:''} financialVisibility={roleSet.financialVisibility} onReceive={processPurchaseOrder} onActionEvent={resolveFlowAction} />
       : route === 'more'
         ? <ProfileScreen
             displayName={auth.user?.displayName || 'Workspace User'}

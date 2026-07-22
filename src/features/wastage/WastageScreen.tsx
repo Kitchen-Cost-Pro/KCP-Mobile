@@ -32,6 +32,7 @@ import {
 } from './wastageApi';
 import { wastageRecoveryStore, type WastageRecovery } from './wastageRecoveryStore';
 import { isApprovalPending } from '../approvals/approvalSubmission';
+import { canSeeOperationalValues, type FinancialVisibility } from '../role-sets/roleSetModel';
 
 type View = 'entry' | 'review' | 'complete';
 
@@ -54,14 +55,16 @@ type Props = {
   userId: string;
   location: KcpLocation | null;
   canSearchItems: boolean;
+  financialVisibility?: FinancialVisibility;
   onLocation: () => void;
   onActionEvent?: (event: 'waiting' | 'complete' | 'reject', detail?: string) => Promise<void>;
 };
 
 const REASONS = ['Spoilage', 'Damaged', 'Expired', 'Preparation loss', 'Quality control', 'Other'];
 
-export function WastageScreen({ workspaceId, userId, location, canSearchItems, onLocation, onActionEvent }: Props) {
+export function WastageScreen({ workspaceId, userId, location, canSearchItems, financialVisibility = 'full', onLocation, onActionEvent }: Props) {
   const connected = useConnectivity();
+  const showMoney = canSeeOperationalValues(financialVisibility);
   const [view, setView] = useState<View>('entry');
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(location));
   const [manualBarcode, setManualBarcode] = useState('');
@@ -291,7 +294,7 @@ export function WastageScreen({ workspaceId, userId, location, canSearchItems, o
     return <div className="screen operation-loading"><LoaderCircle className="spin" size={28} /><span>Checking saved wastage…</span></div>;
   }
 
-  if (view === 'complete' && result) return <WastageComplete result={result} onReset={() => { void reset(); }} />;
+  if (view === 'complete' && result) return <WastageComplete result={result} showMoney={showMoney} onReset={() => { void reset(); }} />;
 
   if (view === 'review' && draft.item && draft.location && activeUom) {
     return (
@@ -422,7 +425,7 @@ function WastageReview({ draft, uom, provisionalBase, finalReason, connected, bu
   );
 }
 
-function WastageComplete({ result, onReset }: { result: WastageResult; onReset: () => void }) {
+function WastageComplete({ result, showMoney, onReset }: { result: WastageResult; showMoney: boolean; onReset: () => void }) {
   return (
     <div className="screen complete-screen">
       <section className="complete-card wastage-complete-card">
@@ -431,7 +434,7 @@ function WastageComplete({ result, onReset }: { result: WastageResult; onReset: 
         <h1>Wastage complete</h1>
         <p>{formatQuantity(result.originalQuantity)} {result.originalUom} of {result.stockItemName} was recorded.</p>
         <div className="transaction-reference"><span>Transaction reference</span><strong>{result.transactionId}</strong></div>
-        <div className="complete-stats"><div><strong>{formatQuantity(result.baseQuantity)} {result.baseUom}</strong><span>stock impact</span></div><div><strong>{formatMoney(result.wastageValue, result.currency)}</strong><span>wastage value</span></div></div>
+        <div className="complete-stats"><div><strong>{formatQuantity(result.baseQuantity)} {result.baseUom}</strong><span>stock impact</span></div>{showMoney && <div><strong>{formatMoney(result.wastageValue, result.currency)}</strong><span>wastage value</span></div>}</div>
         <button className="button button-primary button-large" type="button" onClick={onReset}>Record another item</button>
       </section>
     </div>

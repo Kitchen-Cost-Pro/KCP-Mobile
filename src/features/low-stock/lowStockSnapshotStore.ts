@@ -1,5 +1,6 @@
 import { KeychainAccess, SecureStorage } from '@aparajita/capacitor-secure-storage';
 import { Capacitor } from '@capacitor/core';
+import { isSnapshotFresh } from '../../core/offline/snapshotCache';
 import type { LowStockResponse } from './lowStockApi';
 
 export type LowStockSnapshot = {
@@ -42,7 +43,7 @@ export const lowStockSnapshotStore = {
         const raw = window.sessionStorage.getItem(key(workspaceId, userId, locationId));
         value = raw ? JSON.parse(raw) : null;
       }
-      return valid(value) && value.workspaceId === workspaceId && value.userId === userId && value.locationId === locationId ? value : null;
+      return valid(value) && isSnapshotFresh(value.savedAt) && value.workspaceId === workspaceId && value.userId === userId && value.locationId === locationId ? value : null;
     } catch {
       return null;
     }
