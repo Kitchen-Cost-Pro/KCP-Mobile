@@ -5,7 +5,7 @@ KCP Lite is a React/Vite web app inside a Capacitor 8 shell, so most changes (sc
 ## How it works
 
 - **Plugin:** [`@capgo/capacitor-updater`](https://github.com/Cap-go/capacitor-updater) in manual mode. Capgo's cloud is not used: automatic checks are off and statistics reporting is disabled (`statsUrl: ''`) in `capacitor.config.ts`.
-- **Hosting:** a static HTTPS host we own, intended to be a Cloudflare R2 bucket with a public custom domain (for example `updates.kitchencostpro.com`). Each channel has one `/<channel>/manifest.json`; bundles live at `/bundles/<version>-<hash>.zip` and never change once uploaded.
+- **Hosting:** an assets-only Cloudflare Worker (`kcp-lite-updates`) with no Worker script. Cloudflare states that requests to static assets are free and unlimited on every Workers plan, and an assets-only Worker never runs a script, so serving update checks and downloads is not metered. Each channel has one `/<channel>/manifest.json`; bundles live at `/bundles/<version>-<hash>.zip`. Any static HTTPS host would also work; only the deploy step in the publish script is Cloudflare-specific.
 - **Client (`src/core/updates`):**
   1. On launch the app calls `notifyAppReady()` first. If a new bundle fails to reach that point within 15 seconds, the plugin rolls back to the last working bundle automatically and the failed version is never retried.
   2. It then fetches the channel manifest, and again on foreground at most every 30 minutes.
@@ -31,8 +31,8 @@ Kill switch: `{ "resetToBuiltin": true }`.
 
 ## One-time setup
 
-1. Create an R2 bucket (for example `kcp-lite-updates`) and connect a custom domain such as `updates.kitchencostpro.com`.
-2. Set `VITE_KCP_OTA_BASE_URL=https://updates.kitchencostpro.com` (and optionally `VITE_KCP_OTA_CHANNEL`, default `production`) in the environment used for production builds.
+1. Pick the address: either the free `https://kcp-lite-updates.<your-subdomain>.workers.dev`, or a custom domain such as `updates.kitchencostpro.com` (pass `--domain updates.kitchencostpro.com` on publish).
+2. Set `VITE_KCP_OTA_BASE_URL` to that address (and optionally `VITE_KCP_OTA_CHANNEL`, default `production`) in the environment used for production builds.
 3. Ship one store release that contains this plugin. Live updates only reach devices running that build or later. Until `VITE_KCP_OTA_BASE_URL` is set, the app never checks for updates.
 
 For a test build, set `VITE_KCP_OTA_CHANNEL=staging` so testers receive staging bundles before production.
@@ -42,13 +42,15 @@ For a test build, set `VITE_KCP_OTA_CHANNEL=staging` so testers receive staging 
 ```bash
 npm run check
 npm run build
-# writes ota-out/ and prints the wrangler commands
+# writes ota-out/site and prints the deploy command
 npm run ota:publish -- --channel staging --base-url https://updates.kitchencostpro.com --version 0.22.1
-# or upload directly (bundle first, then manifest)
-npm run ota:publish -- --channel production --version 0.22.1 --rollout 10 --upload --bucket kcp-lite-updates
+# or deploy directly (requires `wrangler login` or CLOUDFLARE_API_TOKEN)
+npm run ota:publish -- --channel production --version 0.22.1 --rollout 10 --deploy
 ```
 
-Options: `--min-native-build` (defaults to the current Android/iOS build number), `--max-native-build`, `--rollout`, `--notes`, `--reset`. `KCP_OTA_BASE_URL` and `KCP_OTA_R2_BUCKET` can replace the flags.
+A deploy replaces every file on the update Worker, so the script first downloads each channel's live manifest (`--channels`, default `production,staging`) and the bundle it points at, verifies its checksum, and redeploys them alongside the new one. Older bundles drop off automatically.
+
+Options: `--min-native-build` (defaults to the current Android/iOS build number), `--max-native-build`, `--rollout`, `--notes`, `--reset`, `--worker` (default `kcp-lite-updates`), `--domain`, `--channels`. `KCP_OTA_BASE_URL` and `KCP_OTA_WORKER` can replace the flags.
 
 Bump `--version` for every publish. Raise the rollout by re-running the command with the same version and a higher `--rollout`.
 
@@ -58,8 +60,14 @@ Bump `--version` for every publish. Raise the rollout by re-running the command 
 - Store policy: Apple (guideline 3.3.1(b)/4.7) and Google Play allow interpreted web code updates that do not change the app's primary purpose or bypass review. Use live updates for fixes and workflow improvements, not to launch a substantially different app.
 - Keep the Worker backward compatible with the oldest bundle still on the channel, as today.
 
+## Cost
+
+Hosting on Workers static assets has no usage charge: Cloudflare's [static assets billing page](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/) states that requests to static assets are free and unlimited, and only requests that invoke a Worker script are billed. This Worker has no script. Limits: 25 MiB per file and 100,000 files per version on Workers Paid (20,000 on Free); a bundle is about 11 MB and the script refuses one over 25 MiB.
+
+To guard against any misconfiguration, set a Cloudflare budget alert (Billing → Budget alerts) at $1.
+
 ## Follow-ups
 
-- **Bundle signing:** checksums stop corrupted or truncated downloads, but whoever controls the bucket controls the code. Capgo supports RSA-signed, encrypted bundles (`publicKey` in config plus `npx @capgo/cli bundle encrypt`); adding that removes the hosting account as a single point of compromise.
+- **Bundle signing:** checksums stop corrupted or truncated downloads, but whoever controls the Cloudflare account controls the code. Capgo supports RSA-signed, encrypted bundles (`publicKey` in config plus `npx @capgo/cli bundle encrypt`); adding that removes the hosting account as a single point of compromise.
 - **Smaller downloads:** the bundle is about 11 MB, mostly the background PNGs. Converting them to WebP or shipping them only in the store build would cut each update to roughly 1 MB.
-- **CI publishing:** a GitHub Actions workflow on release tags can run `npm run ota:publish -- --upload` with an R2 API token secret.
+- **CI publishing:** a GitHub Actions workflow on release tags can run `npm run ota:publish -- --deploy` with a Cloudflare API token secret.

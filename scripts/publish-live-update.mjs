@@ -1,15 +1,17 @@
 #!/usr/bin/env node
-// Packages the built web app (dist/) as a KCP Lite live-update bundle and writes the channel manifest.
+// Packages the built web app (dist/) as a KCP Lite live-update bundle, writes the channel manifest and
+// deploys both as an assets-only Cloudflare Worker. Static asset requests are free and unlimited on
+// every Workers plan and no Worker script runs, so serving updates has no metered usage.
 //
 //   npm run build
-//   npm run ota:publish -- --channel staging --rollout 10
-//   npm run ota:publish -- --channel production --upload --bucket kcp-lite-updates
-//   npm run ota:publish -- --channel production --reset --upload --bucket kcp-lite-updates   (kill switch)
+//   npm run ota:publish -- --channel staging --version 0.22.1 --rollout 10
+//   npm run ota:publish -- --channel production --version 0.22.1 --deploy
+//   npm run ota:publish -- --channel production --reset --deploy   (kill switch)
 //
-// Without --upload, files are written to ota-out/ and the wrangler commands are printed.
+// Without --deploy, the site is written to ota-out/site and the deploy command is printed.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,16 +20,33 @@ import { crc32, deflateRawSync } from 'node:zlib';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const args = parseArgs(process.argv.slice(2));
 const channel = String(args.channel || 'production');
+const channels = [...new Set([channel, ...String(args.channels || 'production,staging').split(',').map((name) => name.trim()).filter(Boolean)])];
 const baseUrl = String(args['base-url'] || process.env.KCP_OTA_BASE_URL || '').replace(/\/+$/, '');
+const workerName = String(args.worker || process.env.KCP_OTA_WORKER || 'kcp-lite-updates');
+const domain = args.domain ? String(args.domain) : '';
 const outDir = path.join(root, 'ota-out');
+const siteDir = path.join(outDir, 'site');
 
-if (!/^[a-z0-9-]+$/i.test(channel)) fail(`Invalid channel "${channel}".`);
-if (!/^https:\/\//i.test(baseUrl)) fail('Set --base-url or KCP_OTA_BASE_URL to the HTTPS host that serves bundles (same value as VITE_KCP_OTA_BASE_URL).');
+for (const name of channels) if (!/^[a-z0-9-]+$/i.test(name)) fail(`Invalid channel "${name}".`);
+if (!/^https:\/\//i.test(baseUrl)) fail('Set --base-url or KCP_OTA_BASE_URL to the HTTPS address of the update Worker (same value as VITE_KCP_OTA_BASE_URL).');
+if (!/^[a-z0-9-]+$/.test(workerName)) fail(`Invalid Worker name "${workerName}".`);
 
-const manifestKey = `${channel}/manifest.json`;
+// A deploy replaces every asset, so first carry over what is live now: each channel's manifest
+// and the bundles they point at, so devices mid-download or on another channel are not broken.
+await rm(siteDir, { recursive: true, force: true });
+await mkdir(path.join(siteDir, 'bundles'), { recursive: true });
+const keepBundles = new Set();
+for (const name of channels) {
+  const live = await fetchJson(`${baseUrl}/${name}/manifest.json`);
+  if (!live) continue;
+  if (name !== channel) await writeManifest(name, live);
+  if (typeof live.url === 'string' && live.url.startsWith(`${baseUrl}/bundles/`)) {
+    const key = live.url.slice(baseUrl.length + 1);
+    if (/^bundles\/[\w.+-]+\.zip$/.test(key) && await carryOverBundle(key, live.sha256)) keepBundles.add(key);
+  }
+}
+
 let manifest;
-let bundleKey = null;
-
 if (args.reset) {
   manifest = { resetToBuiltin: true, releasedAt: new Date().toISOString(), notes: String(args.notes || 'Kill switch: return to store bundle') };
 } else {
@@ -43,33 +62,64 @@ if (args.reset) {
 
   const files = (await listFiles(distDir)).filter((file) => !file.endsWith('.map'));
   const zip = createZip(await Promise.all(files.map(async (file) => ({ name: file, data: await readFile(path.join(distDir, file)) }))));
+  if (zip.length > 25 * 1024 * 1024) fail('Bundle is larger than the 25 MiB Workers static asset limit.');
   const sha256 = createHash('sha256').update(zip).digest('hex');
-  bundleKey = `bundles/${version}-${sha256.slice(0, 12)}.zip`;
-  await mkdir(path.join(outDir, 'bundles'), { recursive: true });
-  await writeFile(path.join(outDir, bundleKey), zip);
+  const bundleKey = `bundles/${version}-${sha256.slice(0, 12)}.zip`;
+  await writeFile(path.join(siteDir, bundleKey), zip);
+  keepBundles.add(bundleKey);
   manifest = { version, url: `${baseUrl}/${bundleKey}`, sha256, minNativeBuild, rollout, releasedAt: new Date().toISOString() };
   if (args['max-native-build'] !== undefined) manifest.maxNativeBuild = Number(args['max-native-build']);
   if (args.notes) manifest.notes = String(args.notes);
   console.log(`Bundle ${version}: ${files.length} files, ${(zip.length / 1024).toFixed(0)} KB, sha256 ${sha256}`);
 }
+await writeManifest(channel, manifest);
+console.log(`Manifest for "${channel}":\n${JSON.stringify(manifest, null, 2)}`);
 
-await mkdir(path.join(outDir, channel), { recursive: true });
-await writeFile(path.join(outDir, manifestKey), `${JSON.stringify(manifest, null, 2)}\n`);
-console.log(`Manifest written to ota-out/${manifestKey}:\n${JSON.stringify(manifest, null, 2)}`);
+const manifestHeaders = channels.map((name) => `/${name}/manifest.json\n  Cache-Control: no-store\n  Content-Type: application/json`);
+await writeFile(path.join(siteDir, '_headers'), `${manifestHeaders.join('\n')}\n/bundles/*\n  Cache-Control: public, max-age=31536000, immutable\n  Content-Type: application/zip\n`);
+const wranglerConfig = {
+  name: workerName,
+  compatibility_date: '2026-10-01',
+  assets: { directory: './site', not_found_handling: 'none' },
+  workers_dev: !domain,
+  ...(domain ? { routes: [{ pattern: domain, custom_domain: true }] } : {})
+};
+await writeFile(path.join(outDir, 'wrangler.jsonc'), `${JSON.stringify(wranglerConfig, null, 2)}\n`);
+console.log(`Site written to ota-out/site (${keepBundles.size} bundle(s) kept).`);
 
-const bucket = String(args.bucket || process.env.KCP_OTA_R2_BUCKET || '');
-const commands = [];
-if (bundleKey) commands.push(['r2', 'object', 'put', `${bucket || '<bucket>'}/${bundleKey}`, '--file', path.join(outDir, bundleKey), '--content-type', 'application/zip', '--cache-control', 'public, max-age=31536000, immutable', '--remote']);
-commands.push(['r2', 'object', 'put', `${bucket || '<bucket>'}/${manifestKey}`, '--file', path.join(outDir, manifestKey), '--content-type', 'application/json', '--cache-control', 'no-store', '--remote']);
-
-if (args.upload) {
-  if (!bucket) fail('Set --bucket or KCP_OTA_R2_BUCKET to upload.');
-  // The bundle goes first so the manifest never points at a file that is not there yet.
-  for (const command of commands) execFileSync('npx', ['wrangler', ...command], { stdio: 'inherit', shell: process.platform === 'win32' });
+const deployArgs = ['wrangler', 'deploy', '--config', path.join(outDir, 'wrangler.jsonc')];
+if (args.deploy) {
+  execFileSync('npx', deployArgs, { stdio: 'inherit', shell: process.platform === 'win32' });
   console.log(`Published to channel "${channel}".`);
 } else {
-  console.log('\nNot uploaded. To publish, run (bundle first, then manifest):');
-  for (const command of commands) console.log(`  npx wrangler ${command.map((part) => (/\s/.test(part) ? `"${part}"` : part)).join(' ')}`);
+  console.log(`\nNot deployed. To publish, run:\n  npx ${deployArgs.join(' ')}`);
+}
+
+async function writeManifest(name, value) {
+  await mkdir(path.join(siteDir, name), { recursive: true });
+  await writeFile(path.join(siteDir, name, 'manifest.json'), `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function fetchJson(url) {
+  try {
+    const response = await fetch(url, { cache: 'no-store' });
+    return response.ok ? await response.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function carryOverBundle(key, expectedSha256) {
+  try {
+    const response = await fetch(`${baseUrl}/${key}`);
+    if (!response.ok) return false;
+    const data = Buffer.from(await response.arrayBuffer());
+    if (createHash('sha256').update(data).digest('hex') !== expectedSha256) return false;
+    await writeFile(path.join(siteDir, key), data);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function currentNativeBuild() {
