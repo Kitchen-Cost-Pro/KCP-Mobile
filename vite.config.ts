@@ -1,7 +1,9 @@
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vitest/config';
 import { loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
+const APP_VERSION = String(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version);
 const DEFAULT_KCP_API = 'https://kcp-api-v2.adminkitchencostpro.workers.dev';
 
 export default defineConfig(({ mode }) => {
@@ -11,6 +13,9 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    define: {
+      __KCP_APP_VERSION__: JSON.stringify(APP_VERSION)
+    },
     server: {
       proxy: {
         '/kcp-api': {

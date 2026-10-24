@@ -1,5 +1,8 @@
 /// <reference types="vite/client" />
 
+/** package.json version baked into this web bundle at build time. */
+declare const __KCP_APP_VERSION__: string;
+
 interface ImportMetaEnv { readonly VITE_SENTRY_DSN?:string; readonly VITE_SENTRY_TRACES_SAMPLE_RATE?:string; }
 interface ImportMeta { readonly env:ImportMetaEnv; }
 
