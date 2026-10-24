@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Building2, ChevronRight, FileText, LogOut, MapPin, RefreshCw, ShieldCheck, Trash2, UserRound } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Building2, ChevronRight, CloudDownload, FileText, LogOut, MapPin, RefreshCw, ShieldCheck, Trash2, UserRound } from 'lucide-react';
 import type { KcpLocation, WorkspaceOption } from '../../types/kcp';
 import type { AccessSnapshot } from '../../types/kcp';
 import { NotificationSettings } from './NotificationSettings';
@@ -7,6 +7,7 @@ import { QuickAccessSettings, type QuickAccessOption } from './QuickAccessSettin
 import type { QuickAccessRoute } from '../../core/navigation/quickAccess';
 import type { RoleSet } from '../role-sets/roleSetModel';
 import { clearReadSnapshots } from '../../core/offline/snapshotCache';
+import { APP_VERSION, checkForLiveUpdate, getLiveUpdateStatus, liveUpdatesConfigured, type LiveUpdateStatus } from '../../core/updates/liveUpdates';
 
 type Props = {
   displayName: string;
@@ -37,6 +38,23 @@ export function ProfileScreen(props: Props) {
     try { await clearReadSnapshots(); setCleared(true); props.onRefresh(); }
     finally { setClearing(false); }
   };
+  const [updateStatus, setUpdateStatus] = useState<LiveUpdateStatus>({ webVersion: APP_VERSION, nativeBuild: null, pendingVersion: null });
+  const [checking, setChecking] = useState(false);
+  const [checkResult, setCheckResult] = useState('');
+  useEffect(() => { void getLiveUpdateStatus().then(setUpdateStatus); }, []);
+  const checkForUpdates = async () => {
+    setChecking(true);
+    setCheckResult('');
+    try {
+      const decision = await checkForLiveUpdate('manual');
+      const status = await getLiveUpdateStatus();
+      setUpdateStatus(status);
+      setCheckResult(status.pendingVersion ? '' : decision ? 'You have the latest version' : 'Could not check right now');
+    } finally { setChecking(false); }
+  };
+  const updateDetail = updateStatus.pendingVersion
+    ? `Version ${updateStatus.pendingVersion} is ready · applies next time you open the app`
+    : checking ? 'Checking…' : checkResult || 'Download the latest fixes without the app store';
   return (
     <div className="screen profile-screen">
       <section className="profile-card">
@@ -82,6 +100,13 @@ export function ProfileScreen(props: Props) {
           <span><strong>Clear cached data</strong><small>{cleared ? 'Cleared · showing live data on next refresh' : 'Remove old offline snapshots (POs, tasks, low stock)'}</small></span>
           <ChevronRight size={18} />
         </button>
+        {liveUpdatesConfigured() && (
+          <button className="settings-row" type="button" onClick={() => void checkForUpdates()} disabled={checking}>
+            <span className="settings-icon"><CloudDownload size={19} /></span>
+            <span><strong>Check for updates</strong><small>{updateDetail}</small></span>
+            <ChevronRight size={18} />
+          </button>
+        )}
         <a className="settings-row" href="/terms.html" target="_blank" rel="noreferrer">
           <span className="settings-icon"><FileText size={19} /></span><span><strong>Terms of Service</strong><small>KCP legal terms</small></span><ChevronRight size={18} />
         </a>
@@ -91,7 +116,7 @@ export function ProfileScreen(props: Props) {
       </section>
 
       <button className="button button-danger button-large" type="button" onClick={props.onSignOut} disabled={props.busy}><LogOut size={19} /> Sign out</button>
-      <p className="version-copy">KCP Lite · v0.20.0</p>
+      <p className="version-copy">KCP Lite · v{updateStatus.webVersion}{updateStatus.nativeBuild ? ` · build ${updateStatus.nativeBuild}` : ''}</p>
     </div>
   );
 }

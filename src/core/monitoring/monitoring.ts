@@ -7,7 +7,7 @@ function loadMonitoring() {
   sentry ||= Promise.all([import('@sentry/capacitor'), import('@sentry/react')]).then(([capacitor, react]) => {
     capacitor.init({
       dsn,
-      release: 'kcp-lite@0.20.0',
+      release: `kcp-lite@${__KCP_APP_VERSION__}`,
       environment: import.meta.env.MODE,
       tracesSampleRate: Number(import.meta.env.VITE_SENTRY_TRACES_SAMPLE_RATE || 0.1),
       sendDefaultPii: false,

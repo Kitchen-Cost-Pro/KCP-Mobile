@@ -13,7 +13,18 @@ const channel = String(import.meta.env.VITE_KCP_OTA_CHANNEL || 'production').tri
 const FOREGROUND_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const MANIFEST_TIMEOUT_MS = 10_000;
 
-type Trigger = 'launch' | 'foreground';
+export const APP_VERSION = __KCP_APP_VERSION__;
+
+export type LiveUpdateStatus = {
+  /** Version of the web bundle that is running now (store bundle or live update). */
+  webVersion: string;
+  /** Store build number, or null outside the native app. */
+  nativeBuild: string | null;
+  /** Live update downloaded and waiting for the next app restart. */
+  pendingVersion: string | null;
+};
+
+type Trigger = 'launch' | 'foreground' | 'manual';
 let inFlight: Promise<LiveUpdateDecision | null> | null = null;
 let lastCheckAt = 0;
 
@@ -29,7 +40,8 @@ export async function initializeLiveUpdates() {
   if (!Capacitor.isNativePlatform()) return;
   // Confirm this bundle booted before anything else; otherwise the plugin rolls back on its own.
   const ready = await CapacitorUpdater.notifyAppReady().catch(() => null);
-  setMonitoringTag('web_bundle', ready?.bundle?.version || 'builtin');
+  setMonitoringTag('web_bundle', APP_VERSION);
+  setMonitoringTag('web_bundle_id', ready?.bundle?.id || 'builtin');
   if (!liveUpdatesConfigured()) return;
   void checkForLiveUpdate('launch');
   void App.addListener('appStateChange', ({ isActive }) => {
@@ -41,6 +53,16 @@ export function checkForLiveUpdate(trigger: Trigger) {
   if (!liveUpdatesConfigured()) return Promise.resolve(null);
   inFlight ||= runCheck(trigger).finally(() => { inFlight = null; });
   return inFlight;
+}
+
+export async function getLiveUpdateStatus(): Promise<LiveUpdateStatus> {
+  if (!Capacitor.isNativePlatform()) return { webVersion: APP_VERSION, nativeBuild: null, pendingVersion: null };
+  const [info, pending] = await Promise.all([
+    App.getInfo().catch(() => null),
+    CapacitorUpdater.getNextBundle().catch(() => null)
+  ]);
+  const pendingVersion = pending && pending.id !== 'builtin' && pending.version !== APP_VERSION ? pending.version : null;
+  return { webVersion: APP_VERSION, nativeBuild: info?.build || null, pendingVersion };
 }
 
 async function fetchManifest() {
