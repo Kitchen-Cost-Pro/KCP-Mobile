@@ -30,3 +30,4 @@ export function captureOperationalError(error: unknown, context: Record<string, 
   }));
 }
 export function setMonitoringUser(uid: string) { void loadMonitoring()?.then((client) => client.setUser(uid ? { id: uid } : null)); }
+export function setMonitoringTag(key: string, value: string) { void loadMonitoring()?.then((client) => client.setTag(key, value)); }
