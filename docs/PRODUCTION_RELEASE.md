@@ -20,6 +20,10 @@
 7. Upload the AAB and IPA, use staged rollout, and monitor authentication failures, notification delivery, deep-link denials, crash-free sessions and API latency.
 8. Promote only after the observation window and an authorised release sign-off.
 
+## Live updates
+
+Web-only fixes can ship between store releases through live updates. See `docs/LIVE_UPDATES.md` for setup, publishing, staged rollout and the kill switch. Native changes always go through the store release sequence above.
+
 ## Rollback
 
 1. Pause store rollout and the notification-dispatch schedule. Do not delete the outbox; retained rows can be inspected or replayed safely by dedupe key.
